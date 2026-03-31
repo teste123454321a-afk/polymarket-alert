@@ -28,4 +28,5 @@ jobs:
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           ALERT_RECIPIENT: ${{ secrets.ALERT_RECIPIENT }}
+          DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
         run: python polymarket_alert.py
