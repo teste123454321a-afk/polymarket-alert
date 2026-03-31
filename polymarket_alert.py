@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Polymarket Iran/Kharg Island — Daily Email Alert v3
-Orderbook analysis + Dune Analytics on-chain whale detection.
+Tiered layout + orderbook + Dune on-chain whale detection.
 """
 
 import json, os, smtplib, time
@@ -24,21 +24,29 @@ WHALE_TRADE_USD = 5000
 NEW_WALLET_HOURS = 72
 
 SEARCH_TERMS = ["kharg", "iran ceasefire", "iran invasion", "hormuz", "iran war", "iran conflict"]
-TRACKED_SLUGS = [
-    "kharg-island-no-longer-under-iranian-control-by",
-    "will-the-kharg-island-oil-terminal-be-hit-by",
+
+# Tiered market tracking
+TIER1_SLUGS = [
     "us-forces-enter-iran-by",
-    "will-the-us-invade-iran-before-2027",
     "us-x-iran-ceasefire-by",
-    "trump-announces-end-of-military-operations-against-iran-by",
-    "will-the-us-officially-declare-war-on-iran-by",
-    "iran-x-israelus-conflict-ends-by",
-    "us-x-iran-ceasefire-before-oil-hits-120",
+    "kharg-island-no-longer-under-iranian-control-by",
 ]
+TIER2_SLUGS = [
+    "us-x-iran-ceasefire-before-oil-hits-120",
+    "iran-leadership-change-or-us-x-iran-ceasefire-first",
+    "iran-x-israelus-conflict-ends-by",
+    "trump-announces-end-of-military-operations-against-iran-by",
+]
+TRACKED_SLUGS = TIER1_SLUGS + TIER2_SLUGS
+
+TIER1_SET = set(TIER1_SLUGS)
+TIER2_SET = set(TIER2_SLUGS)
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 DUNE_API = "https://api.dune.com/api/v1"
+
+# ─── API Helpers ──────────────────────────────────────────────────────────────
 
 def fetch(url, headers=None):
     try:
@@ -59,6 +67,8 @@ def price_history(token_id):
 
 def get_orderbook(token_id):
     return fetch(f"{CLOB}/book?token_id={token_id}")
+
+# ─── Dune Analytics ───────────────────────────────────────────────────────────
 
 DUNE_SIMPLE_SQL = """
 SELECT
@@ -91,8 +101,7 @@ def dune_execute_query(sql, parameters=None):
             print(f"  ⚠️ Dune execute failed: {resp.status_code} {resp.text[:200]}")
             return None
         execution_id = resp.json().get("execution_id")
-        if not execution_id:
-            return None
+        if not execution_id: return None
         print(f"  Dune query submitted: {execution_id}")
         for i in range(24):
             time.sleep(5)
@@ -131,6 +140,8 @@ def get_onchain_whales(token_ids_all):
         })
     return whales
 
+# ─── Discovery ────────────────────────────────────────────────────────────────
+
 def discover():
     found = {}
     for term in SEARCH_TERMS:
@@ -146,6 +157,8 @@ def discover():
             if mid: found[mid] = m
         time.sleep(0.3)
     return list(found.values())
+
+# ─── Orderbook Analysis ──────────────────────────────────────────────────────
 
 def analyse_orderbook(token_id):
     result = {"largest_bid": 0, "largest_ask": 0, "bid_depth": 0, "ask_depth": 0,
@@ -174,10 +187,17 @@ def analyse_orderbook(token_id):
         result["imbalance"] = result["bid_depth"] / result["ask_depth"]
     return result
 
+# ─── Market Analysis ─────────────────────────────────────────────────────────
+
 def parse_json_field(val):
     if isinstance(val, list): return val
     try: return json.loads(val) if isinstance(val, str) else []
     except: return []
+
+def get_tier(slug):
+    if slug in TIER1_SET: return 1
+    if slug in TIER2_SET: return 2
+    return 3
 
 def analyse(market, prev):
     q = market.get("question", "?")
@@ -223,35 +243,74 @@ def analyse(market, prev):
         if len(h) >= 2:
             mv = (h[-1]["p"] - h[-2]["p"]) * 100
             if abs(mv) >= 3: note = f"Intraday {mv:+.1f}pp"
-    return dict(q=q, mid=mid, slug=slug, tokens=tokens,
+    tier = get_tier(slug)
+    return dict(q=q, mid=mid, slug=slug, tokens=tokens, tier=tier,
         url=f"https://polymarket.com/event/{slug}" if slug else "",
         yes=yes, pct=yes*100, delta=delta,
         v24=v24, v1w=v1w, vtot=vtot, liq=liq,
         spike=spike, flags=flags, whale_flags=whale_flags, note=note)
+
+# ─── Context Summary ─────────────────────────────────────────────────────────
+
+def build_context_summary(results):
+    """Generate a human-readable situation summary from the data."""
+    lines = []
+
+    # Find key markets
+    invasion = next((r for r in results if "invade" in r["q"].lower() or "forces enter" in r["q"].lower()), None)
+    ceasefire = next((r for r in results if "ceasefire" in r["q"].lower() and "oil" not in r["q"].lower()), None)
+    kharg = next((r for r in results if "kharg" in r["q"].lower() and "control" in r["q"].lower()), None)
+    oil_cf = next((r for r in results if "ceasefire" in r["q"].lower() and "oil" in r["q"].lower()), None)
+    conflict_end = next((r for r in results if "conflict ends" in r["q"].lower()), None)
+
+    # Overall posture
+    if invasion and invasion["pct"] > 50:
+        lines.append(f"The market sees a <b>{invasion['pct']:.0f}%</b> chance US forces enter Iran — traders expect boots on the ground.")
+    elif invasion:
+        lines.append(f"US ground entry odds at <b>{invasion['pct']:.0f}%</b> — market still leans toward air campaign only.")
+
+    if ceasefire:
+        # Find the nearest non-expired date outcome
+        lines.append(f"Ceasefire probability is at <b>{ceasefire['pct']:.0f}%</b> — {'traders see a deal as likely' if ceasefire['pct'] > 50 else 'deep scepticism about near-term diplomacy'}.")
+
+    if kharg:
+        lines.append(f"Kharg Island changing hands: <b>{kharg['pct']:.0f}%</b>. {'Traders expect a takeover.' if kharg['pct'] > 50 else 'Market bets Iran holds the island.'}")
+
+    if oil_cf:
+        if oil_cf["pct"] < 40:
+            lines.append(f"Only <b>{oil_cf['pct']:.0f}%</b> chance of ceasefire before oil hits $120 — the market expects oil to spike first.")
+        else:
+            lines.append(f"<b>{oil_cf['pct']:.0f}%</b> chance ceasefire comes before $120 oil — a glimmer of diplomatic hope.")
+
+    # Highlight biggest movers
+    movers = sorted(results, key=lambda x: abs(x["delta"]), reverse=True)
+    top_mover = movers[0] if movers and abs(movers[0]["delta"]) >= 3 else None
+    if top_mover:
+        direction = "up" if top_mover["delta"] > 0 else "down"
+        lines.append(f"Biggest 24h move: <b>{top_mover['q'][:60]}</b> — {direction} {abs(top_mover['delta']):.1f}pp.")
+
+    # Whale activity summary
+    whale_markets = [r for r in results if r["whale_flags"]]
+    if whale_markets:
+        lines.append(f"Whale signals detected in <b>{len(whale_markets)}</b> market{'s' if len(whale_markets)>1 else ''}.")
+
+    # Volume anomaly
+    vol_spikes = [r for r in results if any("Vol" in f for f in r["flags"])]
+    if vol_spikes:
+        lines.append(f"Unusual volume in <b>{len(vol_spikes)}</b> market{'s' if len(vol_spikes)>1 else ''} — someone is positioning.")
+
+    return " ".join(lines)
+
+# ─── Email ────────────────────────────────────────────────────────────────────
 
 def fmt(v):
     if v >= 1e6: return f"${v/1e6:.1f}M"
     if v >= 1e3: return f"${v/1e3:.0f}K"
     return f"${v:.0f}"
 
-def build_email(results, onchain_whales):
-    now = datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")
-    flagged = [r for r in results if r["flags"] or r["whale_flags"]]
-    normal = [r for r in results if not r["flags"] and not r["whale_flags"]]
-    flagged.sort(key=lambda x: len(x["whale_flags"]) * 10 + abs(x["delta"]), reverse=True)
-    normal.sort(key=lambda x: x["v24"], reverse=True)
-    ordered = flagged + normal
-    n_odds = len([r for r in results if r["flags"]])
-    n_ob = len([r for r in results if r["whale_flags"]])
-    n_chain = len(onchain_whales)
-    parts = []
-    if n_odds: parts.append(f"{n_odds} odds")
-    if n_ob: parts.append(f"{n_ob} orderbook")
-    if n_chain: parts.append(f"{n_chain} on-chain whales")
-    alert_text = ", ".join(parts)
-    subj = f"🚨 Polymarket Iran: {alert_text} — {now}" if parts else f"📊 Polymarket Iran — {now}"
+def build_market_rows(markets):
     rows = ""
-    for r in ordered:
+    for r in markets:
         cc = "#27ae60" if r["delta"] > 0 else "#e74c3c" if r["delta"] < 0 else "#888"
         cs = f"{r['delta']:+.1f}pp" if r["delta"] else "—"
         fl = ""
@@ -266,6 +325,69 @@ def build_email(results, onchain_whales):
 <td style='padding:8px;text-align:center'>{fmt(r["v24"])}</td>
 <td style='padding:8px;text-align:center'>{fmt(r["vtot"])}</td>
 <td style='padding:8px'>{fl}</td></tr>"""
+    return rows
+
+def build_table_header():
+    return """<table style='width:100%;border-collapse:collapse;font-size:14px'>
+<thead><tr style='background:#f8f9fa;border-bottom:2px solid #dee2e6'>
+<th style='padding:8px;text-align:left'>Market</th>
+<th style='padding:8px;text-align:center'>Yes %</th>
+<th style='padding:8px;text-align:center'>Δ 24h</th>
+<th style='padding:8px;text-align:center'>Vol 24h</th>
+<th style='padding:8px;text-align:center'>Vol Total</th>
+<th style='padding:8px;text-align:left'>Signals</th>
+</tr></thead>"""
+
+def build_email(results, onchain_whales):
+    now = datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")
+
+    # Sort by tier then by alerts
+    tier1 = sorted([r for r in results if r["tier"] == 1],
+                   key=lambda x: len(x["whale_flags"])*10 + abs(x["delta"]), reverse=True)
+    tier2 = sorted([r for r in results if r["tier"] == 2],
+                   key=lambda x: len(x["whale_flags"])*10 + abs(x["delta"]), reverse=True)
+    tier3 = sorted([r for r in results if r["tier"] == 3],
+                   key=lambda x: x["v24"], reverse=True)
+
+    # Subject
+    n_odds = len([r for r in results if r["flags"]])
+    n_ob = len([r for r in results if r["whale_flags"]])
+    n_chain = len(onchain_whales)
+    parts = []
+    if n_odds: parts.append(f"{n_odds} odds")
+    if n_ob: parts.append(f"{n_ob} orderbook")
+    if n_chain: parts.append(f"{n_chain} on-chain whales")
+    alert_text = ", ".join(parts)
+    subj = f"🚨 Polymarket Iran: {alert_text} — {now}" if parts else f"📊 Polymarket Iran — {now}"
+
+    # Context summary
+    context = build_context_summary(results)
+
+    # Tier sections
+    th = build_table_header()
+
+    tier1_html = ""
+    if tier1:
+        tier1_html = f"""
+<h3 style='color:#c0392b;margin-top:25px;margin-bottom:5px'>🔴 Tier 1 — Binary Catalysts</h3>
+<p style='color:#7f8c8d;font-size:12px;margin-top:0'>Ground entry, ceasefire, Kharg Island control. These move everything.</p>
+{th}<tbody>{build_market_rows(tier1)}</tbody></table>"""
+
+    tier2_html = ""
+    if tier2:
+        tier2_html = f"""
+<h3 style='color:#e67e22;margin-top:25px;margin-bottom:5px'>🟠 Tier 2 — Second-Order Signals</h3>
+<p style='color:#7f8c8d;font-size:12px;margin-top:0'>Oil race, leadership change, conflict end date. Early warnings of regime shift.</p>
+{th}<tbody>{build_market_rows(tier2)}</tbody></table>"""
+
+    tier3_html = ""
+    if tier3:
+        tier3_html = f"""
+<h3 style='color:#3498db;margin-top:25px;margin-bottom:5px'>🔵 Tier 3 — Auto-Discovered</h3>
+<p style='color:#7f8c8d;font-size:12px;margin-top:0'>Other Iran/Kharg/Hormuz markets found via search. May contain new or niche markets.</p>
+{th}<tbody>{build_market_rows(tier3)}</tbody></table>"""
+
+    # On-chain whales
     whale_html = ""
     if onchain_whales:
         whale_rows = ""
@@ -282,7 +404,7 @@ def build_email(results, onchain_whales):
 <td style='padding:6px'>{new_badge}{suspicion}</td></tr>"""
         whale_html = f"""
 <h3 style='color:#8e44ad;margin-top:30px;border-bottom:2px solid #8e44ad;padding-bottom:8px'>🐋 On-Chain Whales (24h) — Dune Analytics</h3>
-<p style='color:#7f8c8d;font-size:13px'>Wallets ≥${WHALE_TRADE_USD/1000:.0f}K executed. <b style='color:#e74c3c'>NEW</b> = wallet &lt;72h. <b style='color:#8e44ad'>SUS</b> = new + &gt;$20K.</p>
+<p style='color:#7f8c8d;font-size:12px'>Wallets with ≥${WHALE_TRADE_USD/1000:.0f}K in executed trades. <b style='color:#e74c3c'>NEW</b> = wallet &lt;72h old. <b style='color:#8e44ad'>SUS</b> = new wallet + &gt;$20K.</p>
 <table style='width:100%;border-collapse:collapse;font-size:13px'>
 <thead><tr style='background:#f5eef8;border-bottom:2px solid #d2b4de'>
 <th style='padding:6px;text-align:left'>Wallet</th>
@@ -291,22 +413,34 @@ def build_email(results, onchain_whales):
 <th style='padding:6px;text-align:right'>Largest</th>
 <th style='padding:6px;text-align:left'>Flags</th>
 </tr></thead><tbody>{whale_rows}</tbody></table>"""
+
     html = f"""<html><body style='font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;max-width:900px;margin:0 auto;padding:20px'>
-<h2 style='color:#2c3e50;border-bottom:2px solid #3498db;padding-bottom:10px'>Polymarket Iran / Kharg Island — v3</h2>
-<p style='color:#7f8c8d'>{now} · {len(results)} markets</p>
-<table style='width:100%;border-collapse:collapse;font-size:14px'>
-<thead><tr style='background:#f8f9fa;border-bottom:2px solid #dee2e6'>
-<th style='padding:8px;text-align:left'>Market</th>
-<th style='padding:8px;text-align:center'>Yes %</th>
-<th style='padding:8px;text-align:center'>Δ 24h</th>
-<th style='padding:8px;text-align:center'>Vol 24h</th>
-<th style='padding:8px;text-align:center'>Vol Total</th>
-<th style='padding:8px;text-align:left'>Alerts</th>
-</tr></thead><tbody>{rows}</tbody></table>
+<h2 style='color:#2c3e50;border-bottom:2px solid #3498db;padding-bottom:10px'>Polymarket Iran / Kharg Island</h2>
+<p style='color:#7f8c8d;font-size:13px'>{now} · {len(results)} markets tracked</p>
+
+<div style='background:#f0f4f8;border-left:4px solid #3498db;padding:12px 16px;margin:15px 0;border-radius:0 4px 4px 0'>
+<b style='color:#2c3e50'>📍 Situation:</b>
+<span style='color:#34495e'>{context}</span>
+</div>
+
+{tier1_html}
+{tier2_html}
+{tier3_html}
 {whale_html}
-<p style='color:#bdc3c7;font-size:11px;margin-top:25px'>
-🐋 orderbook = resting orders · 🐋 on-chain = executed trades · Sources: Polymarket + Dune · Not financial advice</p>
-</body></html>"""
+
+<div style='background:#fef9e7;border-left:4px solid #f39c12;padding:10px 14px;margin:20px 0;border-radius:0 4px 4px 0;font-size:12px'>
+<b>How to read signals:</b><br>
+🐋 <b>Orderbook</b> = large resting orders (intent, can be cancelled)<br>
+🐋 <b>On-chain</b> = executed trades (money spent, real signal)<br>
+📈📉 = One side of the book has 2x+ more depth<br>
+🧱 = Single price level with ≥$50K (wall holding/pushing price)<br>
+<b style='color:#e74c3c'>NEW</b> = wallet created &lt;72h ago · <b style='color:#8e44ad'>SUS</b> = new wallet + &gt;$20K (potential insider pattern)<br>
+<b>Sell "Yes"</b> = betting AGAINST the event · <b>Buy "Yes"</b> = betting FOR the event
+</div>
+
+<p style='color:#bdc3c7;font-size:11px;margin-top:15px'>
+Sources: Polymarket Gamma/CLOB APIs + Dune Analytics · Not financial advice
+</p></body></html>"""
     return subj, html
 
 def send(subj, html):
@@ -319,6 +453,8 @@ def send(subj, html):
         s.starttls(); s.login(SMTP_EMAIL, SMTP_PASSWORD)
         s.sendmail(SMTP_EMAIL, [ALERT_RECIPIENT], msg.as_string())
     print(f"✅ Sent to {ALERT_RECIPIENT}")
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     print(f"🔍 Polymarket Alert v3 — {datetime.now(timezone.utc).isoformat()}")
@@ -346,9 +482,10 @@ def main():
     send(subj, html)
     print(f"\n{'='*60}\n  {subj}\n{'='*60}")
     for r in results:
-        print(f"  {r['pct']:5.1f}% Δ{r['delta']:+5.1f}pp  {r['q'][:55]}")
-        for f in r["flags"]: print(f"       🚨 {f}")
-        for f in r["whale_flags"]: print(f"       🐋 {f}")
+        tier_label = {1: "T1", 2: "T2", 3: "T3"}.get(r["tier"], "?")
+        print(f"  [{tier_label}] {r['pct']:5.1f}% Δ{r['delta']:+5.1f}pp  {r['q'][:55]}")
+        for f in r["flags"]: print(f"         🚨 {f}")
+        for f in r["whale_flags"]: print(f"         🐋 {f}")
     if onchain_whales:
         print(f"\n  🐋 ON-CHAIN ({len(onchain_whales)}):")
         for w in onchain_whales[:10]:
