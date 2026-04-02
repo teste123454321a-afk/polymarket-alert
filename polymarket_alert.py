@@ -22,7 +22,6 @@ SNAPSHOT_FILE = Path("polymarket_snapshot.json")
 DUNE_QID_LARGE_TRADES    = os.getenv("DUNE_QID_LARGE_TRADES", "")
 DUNE_QID_WALLET_META     = os.getenv("DUNE_QID_WALLET_META", "")
 DUNE_QID_COORDINATION    = os.getenv("DUNE_QID_COORDINATION", "")
-DUNE_QID_FUNDING_SOURCES = os.getenv("DUNE_QID_FUNDING_SOURCES", "")
 
 ODDS_ALERT_PP = 5
 VOLUME_SPIKE_X = 2.0
@@ -184,56 +183,6 @@ HAVING COUNT(DISTINCT trader) >= 2
 ORDER BY num_new_wallets DESC LIMIT 20
 """
 
-Q_FUNDING_SOURCES = """
-WITH base AS (
-    SELECT "taker" AS trader,
-        GREATEST("makerAmountFilled","takerAmountFilled")/1e6 AS trade_usd,
-        evt_block_time
-    FROM polymarket_polygon.CTFExchange_evt_OrderFilled
-    WHERE evt_block_time >= NOW() - INTERVAL '30' DAY
-),
-adaptive_min AS (
-    SELECT APPROX_PERCENTILE(trade_usd, 0.90) AS min_usd
-    FROM base
-    WHERE evt_block_time >= NOW() - INTERVAL '7' DAY
-),
-flagged AS (
-    SELECT DISTINCT b.trader
-    FROM base b, adaptive_min m
-    WHERE b.evt_block_time >= NOW() - INTERVAL '7' DAY
-    AND b.trade_usd >= m.min_usd
-),
-all_inflows AS (
-    SELECT t."to" AS wallet,
-        t."from" AS funder,
-        TRY_CAST(t.value AS DOUBLE) / 1e6 AS usdc_amount
-    FROM erc20_polygon.evt_Transfer t
-    WHERE LOWER(CAST(t.contract_address AS VARCHAR))
-        = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'
-    AND t."to" IN (SELECT trader FROM flagged)
-    AND t.evt_block_time >= NOW() - INTERVAL '30' DAY
-    AND t."from" != '0x0000000000000000000000000000000000000000'
-),
-adaptive_min_usdc AS (
-    SELECT APPROX_PERCENTILE(usdc_amount, 0.50) AS min_usdc
-    FROM all_inflows
-    WHERE usdc_amount IS NOT NULL
-),
-filtered AS (
-    SELECT a.wallet, a.funder, SUM(a.usdc_amount) AS usdc_received
-    FROM all_inflows a, adaptive_min_usdc m
-    WHERE a.usdc_amount >= m.min_usdc
-    GROUP BY a.wallet, a.funder
-)
-SELECT funder,
-    ARRAY_AGG(DISTINCT wallet) AS funded_wallets,
-    COUNT(DISTINCT wallet) AS wallet_count,
-    SUM(usdc_received) AS total_usdc
-FROM filtered
-GROUP BY funder
-HAVING COUNT(DISTINCT wallet) >= 2
-ORDER BY wallet_count DESC LIMIT 30
-"""
 
 def dune_query(query_id, parameters=None, label=""):
     """Execute a saved Dune query by numeric ID. parameters = {key: value} dict."""
@@ -297,21 +246,13 @@ def get_market_odds():
     except: pass
     return markets
 
-def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
+def score_wallets(trades, meta, coordinated, mkt_ctx):
     meta_idx = {r["wallet"]: r for r in (meta or [])}
 
     coord_wallets = set()
     for row in (coordinated or []):
         for w in (row.get("wallets", []) if isinstance(row.get("wallets"), list) else []):
             coord_wallets.add(w)
-
-    # funded_clusters: funder → list of wallets. flag wallets sharing a funder.
-    wallet_to_funder = {}
-    for row in (funded_clusters or []):
-        funder = row.get("funder", "")
-        if row.get("wallet_count", 0) >= 2:
-            for w in (row.get("funded_wallets", []) if isinstance(row.get("funded_wallets"), list) else []):
-                wallet_to_funder[w] = funder
 
     scored = {}
     for row in (trades or []):
@@ -366,15 +307,10 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
         # 4. Contrarian: buying low-probability outcome (cheap option = classic insider setup)
         if 0 < yp < 0.20: score += 15; reasons.append(f"Contrarian ({yp*100:.0f}% odds)")
 
-        # 5. Coordination: N new wallets same outcome within 24h
+        # 5. Coordination: N new wallets same outcome within 7d
         if wallet in coord_wallets: score += 20; reasons.append("Coordinated cluster (new wallets)")
 
-        # 6. Funding cluster: shared USDC source address (strongest signal — equivalent to same IP)
-        if wallet in wallet_to_funder:
-            f = wallet_to_funder[wallet]
-            score += 25; reasons.append(f"Shared funder {f[:6]}…{f[-4:]}")
-
-        # 7. Peer deviation: trade above p95 for this market
+        # 6. Peer deviation: trade above p95 for this market
         if market_p95 > 0 and largest > market_p95:
             score += 10; reasons.append(f"Above market p95 (${market_p95:,.0f})")
 
@@ -419,12 +355,10 @@ def detect_insiders():
     wallets = list(set(r.get("trader", "") for r in trades))
     print(f"  {len(trades)} trade rows, {len(wallets)} unique wallets")
     meta   = dune_query(DUNE_QID_WALLET_META,     None, "wallet_meta")
-    coord  = dune_query(DUNE_QID_COORDINATION,    None, "coordination")
-    funded = dune_query(DUNE_QID_FUNDING_SOURCES, None, "funding_sources")
-    coord_assets  = len(coord)  if coord  else 0
-    funded_groups = len(funded) if funded else 0
-    print(f"  coord: {coord_assets} assets with clustered new wallets | funded: {funded_groups} shared-funder groups")
-    results = score_wallets(trades, meta, coord, funded, mkt_ctx)
+    coord  = dune_query(DUNE_QID_COORDINATION, None, "coordination")
+    coord_assets = len(coord) if coord else 0
+    print(f"  coord: {coord_assets} assets with clustered new wallets")
+    results = score_wallets(trades, meta, coord, mkt_ctx)
     non_zero = [r["score"] for r in results]
     print(f"  scored: {len(results)} wallets surfaced (median threshold: {sorted(non_zero)[len(non_zero)//2] if non_zero else 'n/a'})")
     return results

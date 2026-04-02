@@ -32,5 +32,4 @@ jobs:
           DUNE_QID_LARGE_TRADES: ${{ secrets.DUNE_QID_LARGE_TRADES }}
           DUNE_QID_WALLET_META: ${{ secrets.DUNE_QID_WALLET_META }}
           DUNE_QID_COORDINATION: ${{ secrets.DUNE_QID_COORDINATION }}
-          DUNE_QID_FUNDING_SOURCES: ${{ secrets.DUNE_QID_FUNDING_SOURCES }}
         run: python polymarket_alert.py
