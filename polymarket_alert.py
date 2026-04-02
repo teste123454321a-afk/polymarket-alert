@@ -17,6 +17,13 @@ ALERT_RECIPIENT = os.getenv("ALERT_RECIPIENT", "") or SMTP_EMAIL
 DUNE_API_KEY = os.getenv("DUNE_API_KEY", "")
 SNAPSHOT_FILE = Path("polymarket_snapshot.json")
 
+# Dune saved-query IDs — create each query in app.dune.com, copy the numeric
+# ID from the URL (e.g. app.dune.com/queries/1234567), add as GitHub Secrets.
+DUNE_QID_LARGE_TRADES    = os.getenv("DUNE_QID_LARGE_TRADES", "")
+DUNE_QID_WALLET_META     = os.getenv("DUNE_QID_WALLET_META", "")
+DUNE_QID_COORDINATION    = os.getenv("DUNE_QID_COORDINATION", "")
+DUNE_QID_FUNDING_SOURCES = os.getenv("DUNE_QID_FUNDING_SOURCES", "")
+
 ODDS_ALERT_PP = 5
 VOLUME_SPIKE_X = 2.0
 WHALE_ORDER_USD = 10000
@@ -197,21 +204,28 @@ HAVING COUNT(DISTINCT wallet) >= 2
 ORDER BY wallet_count DESC LIMIT 30
 """
 
-def dune_query(sql, parameters=None, label=""):
+def dune_query(query_id, parameters=None, label=""):
+    """Execute a saved Dune query by numeric ID. parameters = {key: value} dict."""
     if not DUNE_API_KEY:
         print(f"  ⚠️ No DUNE_API_KEY — skipping {label}")
         return None
+    if not query_id:
+        print(f"  ⚠️ No query ID for {label} — add DUNE_QID_{label.upper()} to Secrets")
+        return None
     headers = {"X-Dune-API-Key": DUNE_API_KEY, "Content-Type": "application/json"}
-    payload = {"query_sql": sql, "performance": "medium"}
-    if parameters: payload["query_parameters"] = parameters
+    payload = {"performance": "medium"}
+    if parameters:
+        payload["query_parameters"] = [
+            {"key": k, "value": v, "type": "text"} for k, v in parameters.items()
+        ]
     try:
-        resp = requests.post(f"{DUNE_API}/query/execute/sql", headers=headers, json=payload, timeout=30)
+        resp = requests.post(f"{DUNE_API}/query/{query_id}/execute", headers=headers, json=payload, timeout=30)
         if resp.status_code != 200:
-            print(f"  ⚠️ Dune {label}: {resp.status_code}")
+            print(f"  ⚠️ Dune {label}: {resp.status_code} — {resp.text[:120]}")
             return None
         eid = resp.json().get("execution_id")
         if not eid: return None
-        print(f"  ⏳ Dune {label}: {eid}")
+        print(f"  ⏳ Dune {label} ({query_id}): {eid}")
         for _ in range(30):
             time.sleep(5)
             sr = requests.get(f"{DUNE_API}/execution/{eid}/status", headers=headers, timeout=15)
@@ -367,15 +381,16 @@ def detect_insiders():
     print("\n🕵️ Insider Detection Module")
     mkt_ctx = get_market_odds()
     print(f"  market_ctx: {len(mkt_ctx)} tokens mapped")
-    trades = dune_query(Q_LARGE_TRADES, None, "large_trades")
+    trades = dune_query(DUNE_QID_LARGE_TRADES, None, "large_trades")
     if not trades:
-        print("  ⚠️ No trades returned — check DUNE_API_KEY secret or query logs")
+        print("  ⚠️ No trades returned — check DUNE_API_KEY and DUNE_QID_LARGE_TRADES secrets")
         return []
     wallets = list(set(r.get("trader", "") for r in trades))
     print(f"  {len(trades)} trade rows, {len(wallets)} unique wallets")
-    meta   = dune_query(Q_WALLET_META,     {"wallets": wallets}, "wallet_meta")
-    coord  = dune_query(Q_COORDINATION,    None,                 "coordination")
-    funded = dune_query(Q_FUNDING_SOURCES, {"wallets": wallets}, "funding_sources")
+    wallets_json = json.dumps(wallets)
+    meta   = dune_query(DUNE_QID_WALLET_META,     {"wallets": wallets_json}, "wallet_meta")
+    coord  = dune_query(DUNE_QID_COORDINATION,    None,                      "coordination")
+    funded = dune_query(DUNE_QID_FUNDING_SOURCES, {"wallets": wallets_json}, "funding_sources")
     coord_assets  = len(coord)  if coord  else 0
     funded_groups = len(funded) if funded else 0
     print(f"  coord: {coord_assets} assets with clustered new wallets | funded: {funded_groups} shared-funder groups")
