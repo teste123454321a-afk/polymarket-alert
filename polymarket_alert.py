@@ -346,22 +346,20 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
         if age <= 72: score += 25; reasons.append(f"New wallet ({age:.0f}h old)")
         if age <= 24: score += 15; reasons.append("Created <24h ago")
 
-        # 2. Z-score: trade size vs 7-day market distribution
-        if max_zscore is not None:
-            z = float(max_zscore)
-            if z >= 4.0:   score += 40; reasons.append(f"Trade size {z:.1f}σ above market mean")
-            elif z >= 3.0: score += 30; reasons.append(f"Trade size {z:.1f}σ above market mean")
-            elif z >= 2.5: score += 20; reasons.append(f"Trade size {z:.1f}σ above market mean")
-            elif z >= 2.0: score += 10; reasons.append(f"Trade size {z:.1f}σ above market mean")
-        else:
-            # No baseline available (<5 trades in 7d): low-liquidity market is itself a context signal
-            reasons.append("Trade in low-volume market (no baseline)")
+        # 2. Z-score: trade size vs 7-day market 
+
+        if max_zscore is not None: z = float(max_zscore)
+        # Reward high Z-scores ONLY if the wallet is relatively inactive
+        if z >= 3.0:
+           boost = 40 if lt < 50 else 5 # Big boost for fresh wallets, tiny for pros
+           score += boost
 
         # 3. Velocity: burst trading (new wallets placing multiple bets fast = coordinated)
-        if num_trades >= 3:
-            if trades_per_hour >= 10:  score += 20; reasons.append(f"Burst: {trades_per_hour:.0f} trades/hr")
-            elif trades_per_hour >= 5: score += 15; reasons.append(f"High velocity: {trades_per_hour:.1f} trades/hr")
-            elif trades_per_hour >= 3: score += 8;  reasons.append(f"Elevated velocity: {trades_per_hour:.1f} trades/hr")
+        # Instead of: score += 20 if trades_per_hour >= 10
+        # Use a multiplier penalty for high-lifetime activity
+        bot_coefficient = 1.0
+        if lt > 500: bot_coefficient = 0.1  # Aggressive dampening for known high-frequency accounts
+        elif lt > 100: bot_coefficient = 0.5
 
         # 4. Contrarian: buying low-probability outcome (cheap option = classic insider setup)
         if 0 < yp < 0.20: score += 15; reasons.append(f"Contrarian ({yp*100:.0f}% odds)")
