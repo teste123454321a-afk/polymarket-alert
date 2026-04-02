@@ -127,14 +127,30 @@ ORDER BY total_usd DESC LIMIT 100
 """
 
 Q_WALLET_META = """
-WITH wallet_list AS (
-    SELECT unnest(CAST({{wallets}} AS ARRAY<VARCHAR>)) AS wallet
+WITH base AS (
+    SELECT "taker" AS trader,
+        GREATEST("makerAmountFilled","takerAmountFilled")/1e6 AS trade_usd,
+        evt_block_time
+    FROM polymarket_polygon.CTFExchange_evt_OrderFilled
+    WHERE evt_block_time >= NOW() - INTERVAL '30' DAY
+),
+adaptive_min AS (
+    SELECT APPROX_PERCENTILE(trade_usd, 0.90) AS min_usd
+    FROM base
+    WHERE evt_block_time >= NOW() - INTERVAL '7' DAY
+),
+flagged AS (
+    SELECT DISTINCT b.trader
+    FROM base b, adaptive_min m
+    WHERE b.evt_block_time >= NOW() - INTERVAL '7' DAY
+    AND b.trade_usd >= m.min_usd
 )
-SELECT "taker" AS wallet, MIN(evt_block_time) AS first_ever_trade,
+SELECT "taker" AS wallet,
+    MIN(evt_block_time) AS first_ever_trade,
     COUNT(*) AS lifetime_trades,
     DATE_DIFF('hour', MIN(evt_block_time), NOW()) AS wallet_age_hours
 FROM polymarket_polygon.CTFExchange_evt_OrderFilled
-WHERE "taker" IN (SELECT wallet FROM wallet_list)
+WHERE "taker" IN (SELECT trader FROM flagged)
 GROUP BY "taker"
 """
 
@@ -169,28 +185,43 @@ ORDER BY num_new_wallets DESC LIMIT 20
 """
 
 Q_FUNDING_SOURCES = """
-WITH wallet_list AS (
-    SELECT unnest(CAST({{wallets}} AS ARRAY<VARCHAR>)) AS wallet
+WITH base AS (
+    SELECT "taker" AS trader,
+        GREATEST("makerAmountFilled","takerAmountFilled")/1e6 AS trade_usd,
+        evt_block_time
+    FROM polymarket_polygon.CTFExchange_evt_OrderFilled
+    WHERE evt_block_time >= NOW() - INTERVAL '30' DAY
+),
+adaptive_min AS (
+    SELECT APPROX_PERCENTILE(trade_usd, 0.90) AS min_usd
+    FROM base
+    WHERE evt_block_time >= NOW() - INTERVAL '7' DAY
+),
+flagged AS (
+    SELECT DISTINCT b.trader
+    FROM base b, adaptive_min m
+    WHERE b.evt_block_time >= NOW() - INTERVAL '7' DAY
+    AND b.trade_usd >= m.min_usd
 ),
 all_inflows AS (
     SELECT t."to" AS wallet,
         t."from" AS funder,
-        CAST(t.value AS DOUBLE) / 1e6 AS usdc_amount
+        TRY_CAST(t.value AS DOUBLE) / 1e6 AS usdc_amount
     FROM erc20_polygon.evt_Transfer t
     WHERE LOWER(CAST(t.contract_address AS VARCHAR))
         = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'
-    AND t."to" IN (SELECT wallet FROM wallet_list)
+    AND t."to" IN (SELECT trader FROM flagged)
     AND t.evt_block_time >= NOW() - INTERVAL '30' DAY
     AND t."from" != '0x0000000000000000000000000000000000000000'
 ),
-adaptive_min AS (
-    -- median inflow for this wallet set: adapts to market size
+adaptive_min_usdc AS (
     SELECT APPROX_PERCENTILE(usdc_amount, 0.50) AS min_usdc
     FROM all_inflows
+    WHERE usdc_amount IS NOT NULL
 ),
 filtered AS (
     SELECT a.wallet, a.funder, SUM(a.usdc_amount) AS usdc_received
-    FROM all_inflows a, adaptive_min m
+    FROM all_inflows a, adaptive_min_usdc m
     WHERE a.usdc_amount >= m.min_usdc
     GROUP BY a.wallet, a.funder
 )
@@ -387,10 +418,9 @@ def detect_insiders():
         return []
     wallets = list(set(r.get("trader", "") for r in trades))
     print(f"  {len(trades)} trade rows, {len(wallets)} unique wallets")
-    wallets_json = json.dumps(wallets)
-    meta   = dune_query(DUNE_QID_WALLET_META,     {"wallets": wallets_json}, "wallet_meta")
-    coord  = dune_query(DUNE_QID_COORDINATION,    None,                      "coordination")
-    funded = dune_query(DUNE_QID_FUNDING_SOURCES, {"wallets": wallets_json}, "funding_sources")
+    meta   = dune_query(DUNE_QID_WALLET_META,     None, "wallet_meta")
+    coord  = dune_query(DUNE_QID_COORDINATION,    None, "coordination")
+    funded = dune_query(DUNE_QID_FUNDING_SOURCES, None, "funding_sources")
     coord_assets  = len(coord)  if coord  else 0
     funded_groups = len(funded) if funded else 0
     print(f"  coord: {coord_assets} assets with clustered new wallets | funded: {funded_groups} shared-funder groups")
