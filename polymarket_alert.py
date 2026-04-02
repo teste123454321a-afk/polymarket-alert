@@ -20,8 +20,6 @@ SNAPSHOT_FILE = Path("polymarket_snapshot.json")
 ODDS_ALERT_PP = 5
 VOLUME_SPIKE_X = 2.0
 WHALE_ORDER_USD = 10000
-INSIDER_MIN_USD = 5000
-INSIDER_SCORE_THRESHOLD = 40
 
 SEARCH_TERMS = ["kharg", "iran ceasefire", "iran invasion", "hormuz", "iran war", "iran conflict"]
 
@@ -79,6 +77,12 @@ WITH base AS (
     FROM polymarket_polygon.CTFExchange_evt_OrderFilled
     WHERE evt_block_time >= NOW() - INTERVAL '7' DAY
 ),
+adaptive_min AS (
+    -- top decile of today's trades: adapts to market volume automatically
+    SELECT APPROX_PERCENTILE(trade_usd, 0.90) AS min_usd
+    FROM base
+    WHERE evt_block_time >= NOW() - INTERVAL '24' HOUR
+),
 market_stats AS (
     SELECT asset_id,
         AVG(trade_usd) AS mean_usd,
@@ -89,10 +93,10 @@ market_stats AS (
     HAVING COUNT(*) >= 5
 ),
 recent AS (
-    SELECT trader, asset_id, trade_usd, evt_block_time
-    FROM base
-    WHERE evt_block_time >= NOW() - INTERVAL '24' HOUR
-    AND trade_usd >= {{min_usd}}
+    SELECT b.trader, b.asset_id, b.trade_usd, b.evt_block_time
+    FROM base b, adaptive_min m
+    WHERE b.evt_block_time >= NOW() - INTERVAL '24' HOUR
+    AND b.trade_usd >= m.min_usd
 )
 SELECT
     r.trader, r.asset_id,
@@ -127,18 +131,27 @@ GROUP BY "taker"
 """
 
 Q_COORDINATION = """
-WITH new_wallet_trades AS (
+WITH first_trades AS (
+    SELECT "taker", MIN(evt_block_time) AS first_ever_trade
+    FROM polymarket_polygon.CTFExchange_evt_OrderFilled
+    GROUP BY "taker"
+),
+adaptive_min AS (
+    SELECT APPROX_PERCENTILE(
+        GREATEST("makerAmountFilled","takerAmountFilled")/1e6, 0.90
+    ) AS min_usd
+    FROM polymarket_polygon.CTFExchange_evt_OrderFilled
+    WHERE evt_block_time >= NOW() - INTERVAL '24' HOUR
+),
+new_wallet_trades AS (
     SELECT of."taker" AS trader, CAST(of."makerAssetId" AS VARCHAR) AS asset_id,
-        of.evt_block_time AS trade_time,
         GREATEST(of."makerAmountFilled",of."takerAmountFilled")/1e6 AS trade_usd
     FROM polymarket_polygon.CTFExchange_evt_OrderFilled of
-    INNER JOIN (
-        SELECT "taker", MIN(evt_block_time) AS ft
-        FROM polymarket_polygon.CTFExchange_evt_OrderFilled GROUP BY "taker"
-    ) fa ON of."taker" = fa."taker"
+    JOIN first_trades ft ON of."taker" = ft."taker"
+    CROSS JOIN adaptive_min m
     WHERE of.evt_block_time >= NOW() - INTERVAL '24' HOUR
-    AND GREATEST(of."makerAmountFilled",of."takerAmountFilled")/1e6 >= {{min_usd}}
-    AND fa.ft >= NOW() - INTERVAL '72' HOUR
+    AND GREATEST(of."makerAmountFilled",of."takerAmountFilled")/1e6 >= m.min_usd
+    AND ft.first_ever_trade >= NOW() - INTERVAL '72' HOUR
 )
 SELECT asset_id, COUNT(DISTINCT trader) AS num_new_wallets,
     SUM(trade_usd) AS total_usd, ARRAY_AGG(DISTINCT trader) AS wallets
@@ -151,24 +164,33 @@ Q_FUNDING_SOURCES = """
 WITH wallet_list AS (
     SELECT unnest(CAST({{wallets}} AS ARRAY<VARCHAR>)) AS wallet
 ),
-inflows AS (
+all_inflows AS (
     SELECT t."to" AS wallet,
         t."from" AS funder,
-        SUM(CAST(t.value AS DOUBLE) / 1e6) AS usdc_received
+        CAST(t.value AS DOUBLE) / 1e6 AS usdc_amount
     FROM erc20_polygon.evt_Transfer t
     WHERE LOWER(CAST(t.contract_address AS VARCHAR))
         = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'
     AND t."to" IN (SELECT wallet FROM wallet_list)
     AND t.evt_block_time >= NOW() - INTERVAL '30' DAY
     AND t."from" != '0x0000000000000000000000000000000000000000'
-    GROUP BY t."to", t."from"
-    HAVING SUM(CAST(t.value AS DOUBLE) / 1e6) >= 100
+),
+adaptive_min AS (
+    -- median inflow for this wallet set: adapts to market size
+    SELECT APPROX_PERCENTILE(usdc_amount, 0.50) AS min_usdc
+    FROM all_inflows
+),
+filtered AS (
+    SELECT a.wallet, a.funder, SUM(a.usdc_amount) AS usdc_received
+    FROM all_inflows a, adaptive_min m
+    WHERE a.usdc_amount >= m.min_usdc
+    GROUP BY a.wallet, a.funder
 )
 SELECT funder,
     ARRAY_AGG(DISTINCT wallet) AS funded_wallets,
     COUNT(DISTINCT wallet) AS wallet_count,
     SUM(usdc_received) AS total_usdc
-FROM inflows
+FROM filtered
 GROUP BY funder
 HAVING COUNT(DISTINCT wallet) >= 2
 ORDER BY wallet_count DESC LIMIT 30
@@ -278,7 +300,7 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
         if age <= 72: score += 25; reasons.append(f"New wallet ({age:.0f}h old)")
         if age <= 24: score += 15; reasons.append("Created <24h ago")
 
-        # 2. Z-score: trade size vs market distribution (replaces fixed $10K/$50K thresholds)
+        # 2. Z-score: trade size vs 7-day market distribution
         if max_zscore is not None:
             z = float(max_zscore)
             if z >= 4.0:   score += 40; reasons.append(f"Trade size {z:.1f}σ above market mean")
@@ -286,9 +308,8 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
             elif z >= 2.5: score += 20; reasons.append(f"Trade size {z:.1f}σ above market mean")
             elif z >= 2.0: score += 10; reasons.append(f"Trade size {z:.1f}σ above market mean")
         else:
-            # Fallback when market baseline unavailable (<5 trades in 7d)
-            if largest >= 50000: score += 20; reasons.append(f"Very large trade ${largest:,.0f}")
-            elif largest >= 10000: score += 10; reasons.append(f"Large trade ${largest:,.0f}")
+            # No baseline available (<5 trades in 7d): low-liquidity market is itself a context signal
+            reasons.append("Trade in low-volume market (no baseline)")
 
         # 3. Velocity: burst trading (new wallets placing multiple bets fast = coordinated)
         if num_trades >= 3:
@@ -329,19 +350,27 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
             "question": mkt.get("question", "Unknown"),
         }
 
-    results = [v for v in scored.values() if v["score"] >= INSIDER_SCORE_THRESHOLD]
+    # Adaptive threshold: return wallets scoring above the median of all non-zero scores.
+    # On quiet days the bar is lower; on active days it rises with the distribution.
+    non_zero = [v["score"] for v in scored.values() if v["score"] > 0]
+    if non_zero:
+        scores_sorted = sorted(non_zero)
+        median = scores_sorted[len(scores_sorted) // 2]
+    else:
+        median = 0
+    results = [v for v in scored.values() if v["score"] >= median and v["score"] > 0]
     results.sort(key=lambda x: x["score"], reverse=True)
-    return results
+    return results[:20]
 
 def detect_insiders():
     print("\n🕵️ Insider Detection Module")
     mkt_ctx = get_market_odds()
     print(f"  {len(mkt_ctx)} tokens mapped")
-    trades = dune_query(Q_LARGE_TRADES, {"min_usd": str(INSIDER_MIN_USD)}, "large_trades")
+    trades = dune_query(Q_LARGE_TRADES, None, "large_trades")
     if not trades: return []
     wallets = list(set(r.get("trader", "") for r in trades))
     meta = dune_query(Q_WALLET_META, {"wallets": wallets}, "wallet_meta")
-    coord = dune_query(Q_COORDINATION, {"min_usd": str(INSIDER_MIN_USD)}, "coordination")
+    coord = dune_query(Q_COORDINATION, None, "coordination")
     funded = dune_query(Q_FUNDING_SOURCES, {"wallets": wallets}, "funding_sources")
     return score_wallets(trades, meta, coord, funded, mkt_ctx)
 
@@ -590,7 +619,8 @@ def build_email(results, insiders):
 <b>Signals guide:</b><br>
 <b style='color:#e74c3c'>Red</b> = odds/volume anomaly · <b style='color:#8e44ad'>Purple</b> = orderbook whale<br>
 🐋 Orderbook = resting orders (intent) · 🕵️ Insider = executed trades scored on patterns<br>
-Score: new wallet (+30) · &lt;24h (+15) · ≥$10K trade (+10) · ≥$50K (+10) · contrarian &lt;20% odds (+15) · coordinated cluster (+20) · &lt;5 lifetime trades (+10) · vol spike (+10)<br>
+Score: new wallet (+25) · &lt;24h (+15) · z≥2σ (+10→+40) · velocity ≥3/hr (+8→+20) · contrarian &lt;20% odds (+15) · coordinated cluster (+20) · shared funder (+25) · above market p95 (+10) · &lt;5 lifetime trades (+10) · vol spike (+10)<br>
+All thresholds adapt to daily market distribution — no fixed USD values.<br>
 <b>Sell "Yes" = betting AGAINST</b> · <b>Buy "Yes" = betting FOR</b></div>
 <p style='color:#bdc3c7;font-size:11px'>Sources: Polymarket Gamma/CLOB + Dune Analytics · Not financial advice</p>
 </body></html>"""
