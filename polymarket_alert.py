@@ -75,15 +75,16 @@ WITH base AS (
         GREATEST("makerAmountFilled","takerAmountFilled")/1e6 AS trade_usd,
         evt_block_time
     FROM polymarket_polygon.CTFExchange_evt_OrderFilled
-    WHERE evt_block_time >= NOW() - INTERVAL '7' DAY
+    WHERE evt_block_time >= NOW() - INTERVAL '30' DAY
 ),
 adaptive_min AS (
-    -- top decile of today's trades: adapts to market volume automatically
+    -- p90 of the last 7 days: adapts to market volume, robust to outliers
     SELECT APPROX_PERCENTILE(trade_usd, 0.90) AS min_usd
     FROM base
-    WHERE evt_block_time >= NOW() - INTERVAL '24' HOUR
+    WHERE evt_block_time >= NOW() - INTERVAL '7' DAY
 ),
 market_stats AS (
+    -- 30-day baseline for z-scores: more stable mean/std than 7-day
     SELECT asset_id,
         AVG(trade_usd) AS mean_usd,
         STDDEV(trade_usd) AS std_usd,
@@ -95,7 +96,7 @@ market_stats AS (
 recent AS (
     SELECT b.trader, b.asset_id, b.trade_usd, b.evt_block_time
     FROM base b, adaptive_min m
-    WHERE b.evt_block_time >= NOW() - INTERVAL '24' HOUR
+    WHERE b.evt_block_time >= NOW() - INTERVAL '7' DAY
     AND b.trade_usd >= m.min_usd
 )
 SELECT
@@ -141,7 +142,7 @@ adaptive_min AS (
         GREATEST("makerAmountFilled","takerAmountFilled")/1e6, 0.90
     ) AS min_usd
     FROM polymarket_polygon.CTFExchange_evt_OrderFilled
-    WHERE evt_block_time >= NOW() - INTERVAL '24' HOUR
+    WHERE evt_block_time >= NOW() - INTERVAL '7' DAY
 ),
 new_wallet_trades AS (
     SELECT of."taker" AS trader, CAST(of."makerAssetId" AS VARCHAR) AS asset_id,
@@ -149,7 +150,7 @@ new_wallet_trades AS (
     FROM polymarket_polygon.CTFExchange_evt_OrderFilled of
     JOIN first_trades ft ON of."taker" = ft."taker"
     CROSS JOIN adaptive_min m
-    WHERE of.evt_block_time >= NOW() - INTERVAL '24' HOUR
+    WHERE of.evt_block_time >= NOW() - INTERVAL '7' DAY
     AND GREATEST(of."makerAmountFilled",of."takerAmountFilled")/1e6 >= m.min_usd
     AND ft.first_ever_trade >= NOW() - INTERVAL '72' HOUR
 )
@@ -365,14 +366,23 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
 def detect_insiders():
     print("\n🕵️ Insider Detection Module")
     mkt_ctx = get_market_odds()
-    print(f"  {len(mkt_ctx)} tokens mapped")
+    print(f"  market_ctx: {len(mkt_ctx)} tokens mapped")
     trades = dune_query(Q_LARGE_TRADES, None, "large_trades")
-    if not trades: return []
+    if not trades:
+        print("  ⚠️ No trades returned — check DUNE_API_KEY secret or query logs")
+        return []
     wallets = list(set(r.get("trader", "") for r in trades))
-    meta = dune_query(Q_WALLET_META, {"wallets": wallets}, "wallet_meta")
-    coord = dune_query(Q_COORDINATION, None, "coordination")
+    print(f"  {len(trades)} trade rows, {len(wallets)} unique wallets")
+    meta   = dune_query(Q_WALLET_META,     {"wallets": wallets}, "wallet_meta")
+    coord  = dune_query(Q_COORDINATION,    None,                 "coordination")
     funded = dune_query(Q_FUNDING_SOURCES, {"wallets": wallets}, "funding_sources")
-    return score_wallets(trades, meta, coord, funded, mkt_ctx)
+    coord_assets  = len(coord)  if coord  else 0
+    funded_groups = len(funded) if funded else 0
+    print(f"  coord: {coord_assets} assets with clustered new wallets | funded: {funded_groups} shared-funder groups")
+    results = score_wallets(trades, meta, coord, funded, mkt_ctx)
+    non_zero = [r["score"] for r in results]
+    print(f"  scored: {len(results)} wallets surfaced (median threshold: {sorted(non_zero)[len(non_zero)//2] if non_zero else 'n/a'})")
+    return results
 
 # ─── Discovery ────────────────────────────────────────────────────────────────
 
