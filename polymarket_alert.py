@@ -46,13 +46,6 @@ GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 DUNE_API = "https://api.dune.com/api/v1"
 
-INSIDER_WEIGHTS = {
-    "new_wallet": 30, "very_new_wallet": 15,
-    "large_trade": 10, "very_large_trade": 10,
-    "contrarian": 15, "coordination": 20,
-    "low_trade_count": 10, "volume_spike_market": 10,
-}
-
 # ─── API Helpers ──────────────────────────────────────────────────────────────
 
 def fetch(url, headers=None):
@@ -78,15 +71,46 @@ def get_orderbook(token_id):
 # ─── Dune ─────────────────────────────────────────────────────────────────────
 
 Q_LARGE_TRADES = """
-SELECT "taker" AS trader, CAST("makerAssetId" AS VARCHAR) AS asset_id,
+WITH base AS (
+    SELECT "taker" AS trader,
+        CAST("makerAssetId" AS VARCHAR) AS asset_id,
+        GREATEST("makerAmountFilled","takerAmountFilled")/1e6 AS trade_usd,
+        evt_block_time
+    FROM polymarket_polygon.CTFExchange_evt_OrderFilled
+    WHERE evt_block_time >= NOW() - INTERVAL '7' DAY
+),
+market_stats AS (
+    SELECT asset_id,
+        AVG(trade_usd) AS mean_usd,
+        STDDEV(trade_usd) AS std_usd,
+        APPROX_PERCENTILE(trade_usd, 0.95) AS p95_usd
+    FROM base
+    GROUP BY asset_id
+    HAVING COUNT(*) >= 5
+),
+recent AS (
+    SELECT trader, asset_id, trade_usd, evt_block_time
+    FROM base
+    WHERE evt_block_time >= NOW() - INTERVAL '24' HOUR
+    AND trade_usd >= {{min_usd}}
+)
+SELECT
+    r.trader, r.asset_id,
     COUNT(*) AS num_trades,
-    SUM(GREATEST("makerAmountFilled","takerAmountFilled")/1e6) AS total_usd,
-    MAX(GREATEST("makerAmountFilled","takerAmountFilled")/1e6) AS largest_trade,
-    MIN(evt_block_time) AS first_trade, MAX(evt_block_time) AS last_trade
-FROM polymarket_polygon.CTFExchange_evt_OrderFilled
-WHERE evt_block_time >= NOW() - INTERVAL '24' HOUR
-AND GREATEST("makerAmountFilled","takerAmountFilled")/1e6 >= {{min_usd}}
-GROUP BY "taker", CAST("makerAssetId" AS VARCHAR)
+    SUM(r.trade_usd) AS total_usd,
+    MAX(r.trade_usd) AS largest_trade,
+    MIN(r.evt_block_time) AS first_trade,
+    MAX(r.evt_block_time) AS last_trade,
+    CASE WHEN ms.std_usd > 0
+        THEN MAX((r.trade_usd - ms.mean_usd) / ms.std_usd)
+        ELSE NULL END AS max_zscore,
+    ms.p95_usd AS market_p95_usd,
+    COUNT(*) * 60.0 / GREATEST(
+        DATE_DIFF('minute', MIN(r.evt_block_time), MAX(r.evt_block_time)) + 1, 1
+    ) AS trades_per_hour
+FROM recent r
+LEFT JOIN market_stats ms ON r.asset_id = ms.asset_id
+GROUP BY r.trader, r.asset_id, ms.std_usd, ms.p95_usd
 ORDER BY total_usd DESC LIMIT 100
 """
 
@@ -121,6 +145,33 @@ SELECT asset_id, COUNT(DISTINCT trader) AS num_new_wallets,
 FROM new_wallet_trades GROUP BY asset_id
 HAVING COUNT(DISTINCT trader) >= 2
 ORDER BY num_new_wallets DESC LIMIT 20
+"""
+
+Q_FUNDING_SOURCES = """
+WITH wallet_list AS (
+    SELECT unnest(CAST({{wallets}} AS ARRAY<VARCHAR>)) AS wallet
+),
+inflows AS (
+    SELECT t."to" AS wallet,
+        t."from" AS funder,
+        SUM(CAST(t.value AS DOUBLE) / 1e6) AS usdc_received
+    FROM erc20_polygon.evt_Transfer t
+    WHERE LOWER(CAST(t.contract_address AS VARCHAR))
+        = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'
+    AND t."to" IN (SELECT wallet FROM wallet_list)
+    AND t.evt_block_time >= NOW() - INTERVAL '30' DAY
+    AND t."from" != '0x0000000000000000000000000000000000000000'
+    GROUP BY t."to", t."from"
+    HAVING SUM(CAST(t.value AS DOUBLE) / 1e6) >= 100
+)
+SELECT funder,
+    ARRAY_AGG(DISTINCT wallet) AS funded_wallets,
+    COUNT(DISTINCT wallet) AS wallet_count,
+    SUM(usdc_received) AS total_usdc
+FROM inflows
+GROUP BY funder
+HAVING COUNT(DISTINCT wallet) >= 2
+ORDER BY wallet_count DESC LIMIT 30
 """
 
 def dune_query(sql, parameters=None, label=""):
@@ -178,24 +229,42 @@ def get_market_odds():
     except: pass
     return markets
 
-def score_wallets(trades, meta, coordinated, mkt_ctx):
+def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
     meta_idx = {r["wallet"]: r for r in (meta or [])}
+
     coord_wallets = set()
     for row in (coordinated or []):
         for w in (row.get("wallets", []) if isinstance(row.get("wallets"), list) else []):
             coord_wallets.add(w)
+
+    # funded_clusters: funder → list of wallets. flag wallets sharing a funder.
+    wallet_to_funder = {}
+    for row in (funded_clusters or []):
+        funder = row.get("funder", "")
+        if row.get("wallet_count", 0) >= 2:
+            for w in (row.get("funded_wallets", []) if isinstance(row.get("funded_wallets"), list) else []):
+                wallet_to_funder[w] = funder
+
     scored = {}
     for row in (trades or []):
         wallet = row.get("trader", "")
         asset = row.get("asset_id", "")
         total_usd = float(row.get("total_usd", 0))
         largest = float(row.get("largest_trade", 0))
-        num_trades = row.get("num_trades", 0)
+        num_trades = int(row.get("num_trades", 0))
+        max_zscore = row.get("max_zscore")  # None when market has <5 trades baseline
+        market_p95 = float(row.get("market_p95_usd") or 0)
+        trades_per_hour = float(row.get("trades_per_hour") or 0)
+
         if wallet in scored:
-            scored[wallet]["total_usd"] += total_usd
-            scored[wallet]["num_trades"] += num_trades
-            if largest > scored[wallet]["largest_trade"]: scored[wallet]["largest_trade"] = largest
+            s = scored[wallet]
+            s["total_usd"] += total_usd
+            s["num_trades"] += num_trades
+            if largest > s["largest_trade"]: s["largest_trade"] = largest
+            if max_zscore and (s["max_zscore"] is None or max_zscore > s["max_zscore"]):
+                s["max_zscore"] = max_zscore
             continue
+
         m = meta_idx.get(wallet, {})
         age = m.get("wallet_age_hours", 9999)
         lt = m.get("lifetime_trades", 9999)
@@ -204,19 +273,62 @@ def score_wallets(trades, meta, coordinated, mkt_ctx):
         vol24 = mkt.get("vol24", 0)
         vol1w = mkt.get("vol1w", 0)
         score, reasons = 0, []
-        if age <= 72: score += INSIDER_WEIGHTS["new_wallet"]; reasons.append(f"New wallet ({age:.0f}h)")
-        if age <= 24: score += INSIDER_WEIGHTS["very_new_wallet"]; reasons.append("Created <24h ago")
-        if largest >= 10000: score += INSIDER_WEIGHTS["large_trade"]; reasons.append(f"Trade ${largest:,.0f}")
-        if largest >= 50000: score += INSIDER_WEIGHTS["very_large_trade"]; reasons.append(f"Very large ${largest:,.0f}")
-        if 0 < yp < 0.20: score += INSIDER_WEIGHTS["contrarian"]; reasons.append(f"Contrarian ({yp*100:.0f}% odds)")
-        if wallet in coord_wallets: score += INSIDER_WEIGHTS["coordination"]; reasons.append("Coordinated cluster")
-        if lt < 5: score += INSIDER_WEIGHTS["low_trade_count"]; reasons.append(f"{lt} lifetime trades")
+
+        # 1. Wallet age — high prior probability of insider
+        if age <= 72: score += 25; reasons.append(f"New wallet ({age:.0f}h old)")
+        if age <= 24: score += 15; reasons.append("Created <24h ago")
+
+        # 2. Z-score: trade size vs market distribution (replaces fixed $10K/$50K thresholds)
+        if max_zscore is not None:
+            z = float(max_zscore)
+            if z >= 4.0:   score += 40; reasons.append(f"Trade size {z:.1f}σ above market mean")
+            elif z >= 3.0: score += 30; reasons.append(f"Trade size {z:.1f}σ above market mean")
+            elif z >= 2.5: score += 20; reasons.append(f"Trade size {z:.1f}σ above market mean")
+            elif z >= 2.0: score += 10; reasons.append(f"Trade size {z:.1f}σ above market mean")
+        else:
+            # Fallback when market baseline unavailable (<5 trades in 7d)
+            if largest >= 50000: score += 20; reasons.append(f"Very large trade ${largest:,.0f}")
+            elif largest >= 10000: score += 10; reasons.append(f"Large trade ${largest:,.0f}")
+
+        # 3. Velocity: burst trading (new wallets placing multiple bets fast = coordinated)
+        if num_trades >= 3:
+            if trades_per_hour >= 10:  score += 20; reasons.append(f"Burst: {trades_per_hour:.0f} trades/hr")
+            elif trades_per_hour >= 5: score += 15; reasons.append(f"High velocity: {trades_per_hour:.1f} trades/hr")
+            elif trades_per_hour >= 3: score += 8;  reasons.append(f"Elevated velocity: {trades_per_hour:.1f} trades/hr")
+
+        # 4. Contrarian: buying low-probability outcome (cheap option = classic insider setup)
+        if 0 < yp < 0.20: score += 15; reasons.append(f"Contrarian ({yp*100:.0f}% odds)")
+
+        # 5. Coordination: N new wallets same outcome within 24h
+        if wallet in coord_wallets: score += 20; reasons.append("Coordinated cluster (new wallets)")
+
+        # 6. Funding cluster: shared USDC source address (strongest signal — equivalent to same IP)
+        if wallet in wallet_to_funder:
+            f = wallet_to_funder[wallet]
+            score += 25; reasons.append(f"Shared funder {f[:6]}…{f[-4:]}")
+
+        # 7. Peer deviation: trade above p95 for this market
+        if market_p95 > 0 and largest > market_p95:
+            score += 10; reasons.append(f"Above market p95 (${market_p95:,.0f})")
+
+        # 8. Low lifetime trades
+        if lt < 5: score += 10; reasons.append(f"{lt} lifetime trades total")
+
+        # 9. Volume spike on market
         avg_d = vol1w / 7 if vol1w > 0 else 0
-        if avg_d > 0 and vol24 > avg_d * 3: score += INSIDER_WEIGHTS["volume_spike_market"]; reasons.append(f"Vol spike {vol24/avg_d:.1f}x")
-        scored[wallet] = {"wallet": wallet, "wallet_short": f"{wallet[:6]}...{wallet[-4:]}" if len(wallet)>10 else wallet,
-            "score": min(score, 100), "reasons": reasons, "total_usd": total_usd,
-            "largest_trade": largest, "num_trades": num_trades, "age_hours": age,
-            "lifetime_trades": lt, "question": mkt.get("question", "Unknown")}
+        if avg_d > 0 and vol24 > avg_d * 3:
+            score += 10; reasons.append(f"Market vol spike {vol24/avg_d:.1f}x")
+
+        scored[wallet] = {
+            "wallet": wallet,
+            "wallet_short": f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 10 else wallet,
+            "score": min(score, 100), "reasons": reasons,
+            "total_usd": total_usd, "largest_trade": largest,
+            "num_trades": num_trades, "age_hours": age, "lifetime_trades": lt,
+            "max_zscore": max_zscore, "trades_per_hour": trades_per_hour,
+            "question": mkt.get("question", "Unknown"),
+        }
+
     results = [v for v in scored.values() if v["score"] >= INSIDER_SCORE_THRESHOLD]
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
@@ -227,10 +339,11 @@ def detect_insiders():
     print(f"  {len(mkt_ctx)} tokens mapped")
     trades = dune_query(Q_LARGE_TRADES, {"min_usd": str(INSIDER_MIN_USD)}, "large_trades")
     if not trades: return []
-    wallets = list(set(r.get("trader","") for r in trades))
+    wallets = list(set(r.get("trader", "") for r in trades))
     meta = dune_query(Q_WALLET_META, {"wallets": wallets}, "wallet_meta")
     coord = dune_query(Q_COORDINATION, {"min_usd": str(INSIDER_MIN_USD)}, "coordination")
-    return score_wallets(trades, meta, coord, mkt_ctx)
+    funded = dune_query(Q_FUNDING_SOURCES, {"wallets": wallets}, "funding_sources")
+    return score_wallets(trades, meta, coord, funded, mkt_ctx)
 
 # ─── Discovery ────────────────────────────────────────────────────────────────
 
