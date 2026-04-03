@@ -35,9 +35,13 @@ DUNE_QID_WALLET_META     = os.getenv("DUNE_QID_WALLET_META", "")
 DUNE_QID_COORDINATION    = os.getenv("DUNE_QID_COORDINATION", "")
 DUNE_QID_FUNDING_SOURCES = os.getenv("DUNE_QID_FUNDING_SOURCES", "")
 
-ODDS_ALERT_PP  = 5
-VOLUME_SPIKE_X = 2.0
-WHALE_ORDER_USD = 10000
+ODDS_ALERT_PP    = 5
+VOLUME_SPIKE_X   = 2.0
+WHALE_ORDER_USD  = 10000
+
+# Trades on markets expiring within this window are filtered out before scoring.
+# Near-expiry wash trading is a money laundering pattern, not insider trading.
+NEAR_EXPIRY_HOURS = 48
 
 # NegRisk exchange contract — appears as taker in multi-leg matches, not a real trader
 NEGRISK_EXCHANGE = "0xc5d563a36ae78145c45a50134d48a1215220f80a"
@@ -355,13 +359,30 @@ def dune_query(query_id, parameters=None, label=""):
 # ─── Insider Detection ────────────────────────────────────────────────────────
 
 def get_market_odds():
+    """
+    Fetch market context for ALL active Polymarket markets, paginating until
+    exhausted. Used by detect_insiders() to enrich wallet scores with question
+    text, yes_price, and volume — regardless of topic.
+    """
     markets = {}
-    try:
-        data = requests.get(
-            f"{GAMMA}/markets?active=true&closed=false&limit=200&order=volume24hr&ascending=false",
-            timeout=15
-        ).json()
-        for m in (data if isinstance(data, list) else []):
+    offset = 0
+    limit = 500
+    while True:
+        try:
+            data = requests.get(
+                f"{GAMMA}/markets?active=true&closed=false"
+                f"&limit={limit}&offset={offset}"
+                f"&order=volume24hr&ascending=false",
+                timeout=20
+            ).json()
+        except Exception as e:
+            print(f"  ⚠️ get_market_odds page error (offset={offset}): {e}")
+            break
+
+        if not isinstance(data, list) or not data:
+            break
+
+        for m in data:
             tokens = m.get("clobTokenIds", "")
             if isinstance(tokens, str):
                 try: tokens = json.loads(tokens)
@@ -374,13 +395,18 @@ def get_market_odds():
             for tid in tokens:
                 markets[tid] = {
                     "question": m.get("question", ""),
-                    "slug": m.get("slug", ""),
+                    "slug":     m.get("slug", ""),
                     "yes_price": yp,
-                    "vol24": m.get("volume24hr", 0) or 0,
-                    "vol1w": m.get("volume1wk", 0) or 0,
+                    "vol24":    m.get("volume24hr", 0) or 0,
+                    "vol1w":    m.get("volume1wk",  0) or 0,
                 }
-    except:
-        pass
+
+        if len(data) < limit:
+            break  # last page
+
+        offset += limit
+        time.sleep(0.3)
+
     return markets
 
 
@@ -480,10 +506,16 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
                 score += 6
                 reasons.append(f"New wallet elevated: {trades_per_hour:.1f} trades/hr")
 
-        # ── 4. Contrarian: buying low-probability outcome ─────────────────────
-        if 0 < yp < 0.20:
+        # ── 4. Contrarian: betting on a low-probability outcome ───────────────
+        # A net long (buying YES) is contrarian if yes_price is low.
+        # A net short (buying NO) is contrarian if yes_price is HIGH —
+        # the implied NO price (1 - yes_price) must be low.
+        # e.g. wallet buys NO on a 99.9% YES market → implied price = 0.1% → NOT contrarian.
+        is_net_short = sell_usd > buy_usd
+        implied_price = (1 - yp) if is_net_short else yp
+        if 0 < implied_price < 0.20:
             score += 15
-            reasons.append(f"Contrarian ({yp*100:.0f}% odds)")
+            reasons.append(f"Contrarian ({'NO' if is_net_short else 'YES'} @ {implied_price*100:.0f}% odds)")
 
         # ── 5. Coordination: N new wallets on same outcome within 24h ─────────
         if wallet in coord_wallets:
@@ -566,6 +598,81 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
     return results[:20]
 
 
+def fetch_market_end_dates(asset_ids):
+    """
+    Given a collection of CLOB token asset_ids (strings), return a dict mapping
+    each asset_id → endDateIso (ISO string) by querying the Gamma API in batches.
+
+    Gamma supports ?clob_token_ids=<id1>,<id2>,... — we chunk to 50 per request
+    to stay well within URL length limits.
+    """
+    asset_ids = list(set(asset_ids))
+    end_dates = {}
+    chunk_size = 50
+
+    for i in range(0, len(asset_ids), chunk_size):
+        chunk = asset_ids[i:i + chunk_size]
+        ids_param = ",".join(chunk)
+        try:
+            r = requests.get(
+                f"{GAMMA}/markets?clob_token_ids={ids_param}&limit={chunk_size}",
+                timeout=15,
+                headers={"Accept": "application/json"},
+            )
+            if r.status_code != 200:
+                continue
+            for m in (r.json() if isinstance(r.json(), list) else []):
+                end_iso = m.get("endDateIso") or m.get("endDate") or ""
+                tokens = m.get("clobTokenIds", "")
+                if isinstance(tokens, str):
+                    try: tokens = json.loads(tokens)
+                    except: tokens = []
+                for tid in tokens:
+                    if end_iso:
+                        end_dates[str(tid)] = end_iso
+        except Exception as e:
+            print(f"  ⚠️ fetch_market_end_dates chunk {i}: {e}")
+        time.sleep(0.2)
+
+    return end_dates
+
+
+def filter_near_expiry_trades(trades, end_dates, hours=NEAR_EXPIRY_HOURS):
+    """
+    Drop trade rows where the market's end date is within `hours` of now.
+    These are near-expiry wash trades — a money laundering pattern where both
+    sides of a resolving market are traded to legitimise funds, not an insider signal.
+    """
+    now = datetime.now(timezone.utc)
+    kept, dropped = [], 0
+
+    for row in trades:
+        asset_id = row.get("asset_id", "")
+        end_iso  = end_dates.get(str(asset_id), "")
+
+        if not end_iso:
+            # No end date found — keep the row (benefit of the doubt)
+            kept.append(row)
+            continue
+
+        try:
+            # Handle both Z-suffixed and offset-aware ISO strings
+            end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+            hours_remaining = (end_dt - now).total_seconds() / 3600
+            if hours_remaining <= hours:
+                dropped += 1
+            else:
+                kept.append(row)
+        except Exception:
+            # Unparseable date — keep the row
+            kept.append(row)
+
+    if dropped:
+        print(f"  🚫 Filtered {dropped} trade rows on markets expiring within {hours}h (near-expiry wash pattern)")
+
+    return kept
+
+
 def detect_insiders():
     print("\n🕵️ Insider Detection Module")
     mkt_ctx = get_market_odds()
@@ -576,8 +683,16 @@ def detect_insiders():
         print("  ⚠️ No trades returned — check DUNE_API_KEY and DUNE_QID_LARGE_TRADES secrets")
         return []
 
+    print(f"  {len(trades)} trade rows from Dune")
+
+    # Filter out near-expiry markets before scoring — these are wash trading
+    # patterns for money laundering, not insider signals.
+    asset_ids  = list(set(r.get("asset_id", "") for r in trades))
+    end_dates  = fetch_market_end_dates(asset_ids)
+    trades     = filter_near_expiry_trades(trades, end_dates)
+
     wallets = list(set(r.get("trader", "") for r in trades))
-    print(f"  {len(trades)} trade rows, {len(wallets)} unique wallets")
+    print(f"  {len(trades)} trade rows after near-expiry filter, {len(wallets)} unique wallets")
 
     meta   = dune_query(DUNE_QID_WALLET_META,     None, "wallet_meta")
     coord  = dune_query(DUNE_QID_COORDINATION,    None, "coordination")
@@ -912,11 +1027,9 @@ def send(subj, html):
 def main():
     print(f"🔍 Polymarket Alert v5 — {datetime.now(timezone.utc).isoformat()}")
 
-    # 1. Iran-specific markets
+    # 1. Iran-specific markets (optional — email still sends if empty)
     markets = discover()
     print(f"Found {len(markets)} Iran markets")
-    if not markets:
-        return
 
     prev = json.loads(SNAPSHOT_FILE.read_text()) if SNAPSHOT_FILE.exists() else {}
     results = []
@@ -927,7 +1040,8 @@ def main():
             print(f"⚠️ {e}")
         time.sleep(0.2)
 
-    # 2. Insider detection (ALL markets, pattern-based)
+    # 2. Insider detection — always runs across ALL Polymarket markets,
+    #    independent of whether any Iran markets were found above.
     insiders = detect_insiders()
 
     # 3. Save snapshot & send
