@@ -200,9 +200,12 @@ LIMIT 100
 """
 
 Q_WALLET_META = """
-WITH base AS (
+base AS (
     SELECT "taker" AS trader,
-        GREATEST("makerAmountFilled","takerAmountFilled")/1e6 AS trade_usd,
+        CASE
+            WHEN "makerAssetId" = 0 THEN "makerAmountFilled" / 1e6
+            ELSE "takerAmountFilled" / 1e6
+        END AS trade_usd,
         evt_block_time
     FROM polymarket_polygon.CTFExchange_evt_OrderFilled
     WHERE evt_block_time >= NOW() - INTERVAL '30' DAY
@@ -241,7 +244,11 @@ adaptive_min AS (
     WHERE evt_block_time >= NOW() - INTERVAL '7' DAY
 ),
 new_wallet_trades AS (
-    SELECT of."taker" AS trader, CAST(of."makerAssetId" AS VARCHAR) AS asset_id,
+    SELECT of."taker" AS trader,
+        CASE
+            WHEN CAST(of."makerAssetId" AS VARCHAR) != '0' THEN CAST(of."makerAssetId" AS VARCHAR)
+            ELSE CAST(of."takerAssetId" AS VARCHAR)
+        END AS asset_id,
         GREATEST(of."makerAmountFilled",of."takerAmountFilled")/1e6 AS trade_usd
     FROM polymarket_polygon.CTFExchange_evt_OrderFilled of
     JOIN first_trades ft ON of."taker" = ft."taker"
@@ -359,61 +366,41 @@ def dune_query(query_id, parameters=None, label=""):
 # ─── Insider Detection ────────────────────────────────────────────────────────
 
 def get_market_odds():
-    """
-    Fetch market context for ALL active Polymarket markets, paginating until
-    exhausted. Used by detect_insiders() to enrich wallet scores with question
-    text, yes_price, and volume — regardless of topic.
-    """
     markets = {}
-    offset = 0
-    limit = 500
-    while True:
-        try:
+    try:
+        offset = 0
+        while True:
             data = requests.get(
-                f"{GAMMA}/markets?active=true&closed=false"
-                f"&limit={limit}&offset={offset}"
-                f"&order=volume24hr&ascending=false",
-                timeout=20
+                f"{GAMMA}/markets?active=true&closed=false&limit=200&order=volume24hr&ascending=false&offset={offset}",
+                timeout=15
             ).json()
-        except Exception as e:
-            print(f"  ⚠️ get_market_odds page error (offset={offset}): {e}")
-            break
-
-        if not isinstance(data, list) or not data:
-            break
-
-        for m in data:
-            tokens = m.get("clobTokenIds", "")
-            if isinstance(tokens, str):
-                try: tokens = json.loads(tokens)
-                except: tokens = []
-            prices = m.get("outcomePrices", "")
-            if isinstance(prices, str):
-                try: prices = json.loads(prices)
-                except: prices = []
-
-            # tokens[0] = YES token, tokens[1] = NO token (binary market convention).
-            # Store each token with its own side so the scorer gets the correct
-            # implied price regardless of which token Dune returns as asset_id.
-            yes_price = float(prices[0]) if len(prices) > 0 else 0.5
-            base = {
-                "question": m.get("question", ""),
-                "slug":     m.get("slug", ""),
-                "yes_price": yes_price,
-                "vol24":    m.get("volume24hr", 0) or 0,
-                "vol1w":    m.get("volume1wk",  0) or 0,
-            }
-            if len(tokens) > 0:
-                markets[str(tokens[0])] = {**base, "token_side": "YES"}
-            if len(tokens) > 1:
-                markets[str(tokens[1])] = {**base, "token_side": "NO"}
-
-        if len(data) < limit:
-            break  # last page
-
-        offset += limit
-        time.sleep(0.3)
-
+            page = data if isinstance(data, list) else []
+            if not page:
+                break
+            for m in page:
+                tokens = m.get("clobTokenIds", "")
+                if isinstance(tokens, str):
+                    try: tokens = json.loads(tokens)
+                    except: tokens = []
+                prices = m.get("outcomePrices", "")
+                if isinstance(prices, str):
+                    try: prices = json.loads(prices)
+                    except: prices = []
+                yp = float(prices[0]) if prices else 0
+                for tid in tokens:
+                    markets[tid] = {
+                        "question": m.get("question", ""),
+                        "slug": m.get("slug", ""),
+                        "yes_price": yp,
+                        "vol24": m.get("volume24hr", 0) or 0,
+                        "vol1w": m.get("volume1wk", 0) or 0,
+                    }
+            if len(page) < 200:
+                break
+            offset += 200
+            time.sleep(0.3)
+    except:
+        pass
     return markets
 
 
@@ -451,22 +438,19 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
         # z-score and trades_per_hour across all assets.
         # net_ratio: recompute from running buy/sell totals so it stays accurate.
         if wallet in scored:
-            s = scored[wallet]
-            s["total_usd"]   += total_usd
-            s["num_trades"]  += num_trades
-            s["buy_usd"]     += buy_usd
-            s["sell_usd"]    += sell_usd
-            s["net_ratio"]    = (
-                abs(s["buy_usd"] - s["sell_usd"]) / s["total_usd"]
-                if s["total_usd"] > 0 else 0
-            )
-            if largest > s["largest_trade"]:
-                s["largest_trade"] = largest
-            if max_zscore and (s["max_zscore"] is None or float(max_zscore) > float(s["max_zscore"] or 0)):
-                s["max_zscore"] = max_zscore
-            if trades_per_hour > s["trades_per_hour"]:
-                s["trades_per_hour"] = trades_per_hour
-            continue
+          s = scored[wallet]
+          s["total_usd"]  += total_usd
+          s["num_trades"] += num_trades
+          s["buy_usd"]    += buy_usd
+          s["sell_usd"]   += sell_usd
+          s["net_position_usd"] = s["buy_usd"] - s["sell_usd"]
+          total_traded = s["buy_usd"] + s["sell_usd"]
+          s["net_ratio"] = abs(s["net_position_usd"]) / total_traded if total_traded > 0 else 0
+          if largest > s["largest_trade"]:
+              s["largest_trade"] = largest
+          if max_zscore and (s["max_zscore"] is None or max_zscore > s["max_zscore"]):
+              s["max_zscore"] = max_zscore
+          continue
 
         m   = meta_idx.get(wallet, {})
         age = m.get("wallet_age_hours", 9999)
@@ -608,6 +592,9 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
             "net_ratio":     net_ratio,
             "slug":          mkt.get("slug", ""),
             "question":      mkt.get("question", "Unknown"),
+            "net_position_usd": buy_usd - sell_usd,
+            "buy_usd":          buy_usd,
+            "sell_usd":         sell_usd,
         }
 
     # Adaptive threshold: 65th percentile with hard floor of 30.
@@ -846,15 +833,24 @@ def analyse(market, prev):
     tokens = parse_json_field(market.get("clobTokenIds", ""))
     whale_flags = []
     if tokens:
-        ob = analyse_orderbook(tokens[0])
+        ob_yes = analyse_orderbook(tokens[0])
         time.sleep(0.2)
-        n = len(ob["whale_orders"])
+        ob_no  = analyse_orderbook(tokens[1]) if len(tokens) > 1 else {"whale_orders": [], "imbalance": 1.0, "bid_wall": None, "ask_wall": None, "bid_depth": 0, "ask_depth": 0, "largest_bid": 0, "largest_ask": 0}
+        time.sleep(0.2)
+
+        # Merge whale orders from both sides
+        all_whale_orders = ob_yes["whale_orders"] + ob_no["whale_orders"]
+        combined_bid = ob_yes["bid_depth"] + ob_no["bid_depth"]
+        combined_ask = ob_yes["ask_depth"] + ob_no["ask_depth"]
+
+        ob = ob_yes  # keep for wall references
+        n = len(all_whale_orders)
         if n > 0:
-            total = sum(w["usd"] for w in ob["whale_orders"])
-            buys  = len([w for w in ob["whale_orders"] if w["side"] == "BUY"])
+            total = sum(w["usd"] for w in all_whale_orders)
+            buys  = len([w for w in all_whale_orders if w["side"] == "BUY"])
             sells = n - buys
             whale_flags.append(f"🐋 {n} large order{'s'*(n>1)}: {buys}B/{sells}S (${total:,.0f})")
-        imb = ob["imbalance"]
+        imb = combined_bid / combined_ask if combined_ask > 0 else 1.0
         if imb >= 2.0:
             whale_flags.append(f"📈 Buy pressure {imb:.1f}x")
         elif imb <= 0.5:
