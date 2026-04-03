@@ -283,44 +283,54 @@ def score_wallets(trades, meta, coordinated, mkt_ctx):
         vol1w = mkt.get("vol1w", 0)
         score, reasons = 0, []
 
+        # Guard flags — suppress size/velocity signals for non-suspicious contexts
+        market_is_active = asset in mkt_ctx          # False = closed/resolved market
+        is_near_certain  = market_is_active and yp > 0.90  # yield farming context
+        score_size       = market_is_active and not is_near_certain
+
         # 1. Wallet age — high prior probability of insider
         if age <= 72: score += 25; reasons.append(f"New wallet ({age:.0f}h old)")
         if age <= 24: score += 15; reasons.append("Created <24h ago")
 
         # 2. Z-score: trade size vs 7-day market distribution
-        if max_zscore is not None:
-            z = float(max_zscore)
-            if z >= 4.0:   score += 40; reasons.append(f"Trade size {z:.1f}σ above market mean")
-            elif z >= 3.0: score += 30; reasons.append(f"Trade size {z:.1f}σ above market mean")
-            elif z >= 2.5: score += 20; reasons.append(f"Trade size {z:.1f}σ above market mean")
-            elif z >= 2.0: score += 10; reasons.append(f"Trade size {z:.1f}σ above market mean")
-        else:
-            # No baseline available (<5 trades in 7d): low-liquidity market is itself a context signal
-            reasons.append("Trade in low-volume market (no baseline)")
+        if score_size:
+            if max_zscore is not None:
+                z = float(max_zscore)
+                if z >= 4.0:   score += 40; reasons.append(f"Trade size {z:.1f}σ above market mean")
+                elif z >= 3.0: score += 30; reasons.append(f"Trade size {z:.1f}σ above market mean")
+                elif z >= 2.5: score += 20; reasons.append(f"Trade size {z:.1f}σ above market mean")
+                elif z >= 2.0: score += 10; reasons.append(f"Trade size {z:.1f}σ above market mean")
+            else:
+                reasons.append("Trade in low-volume market (no baseline)")
+        elif not market_is_active:
+            reasons.append("Resolved/closed market — size signals skipped")
+        elif is_near_certain:
+            reasons.append(f"Near-certain market ({yp*100:.0f}% odds) — yield farming context")
 
-        # 3. Velocity: burst trading (new wallets placing multiple bets fast = coordinated)
-        if num_trades >= 3:
+        # 3. Velocity: burst trading
+        if score_size and num_trades >= 3:
             if trades_per_hour >= 10:  score += 20; reasons.append(f"Burst: {trades_per_hour:.0f} trades/hr")
             elif trades_per_hour >= 5: score += 15; reasons.append(f"High velocity: {trades_per_hour:.1f} trades/hr")
             elif trades_per_hour >= 3: score += 8;  reasons.append(f"Elevated velocity: {trades_per_hour:.1f} trades/hr")
 
-        # 4. Contrarian: buying low-probability outcome (cheap option = classic insider setup)
+        # 4. Contrarian: buying low-probability outcome
         if 0 < yp < 0.20: score += 15; reasons.append(f"Contrarian ({yp*100:.0f}% odds)")
 
         # 5. Coordination: N new wallets same outcome within 7d
         if wallet in coord_wallets: score += 20; reasons.append("Coordinated cluster (new wallets)")
 
         # 6. Peer deviation: trade above p95 for this market
-        if market_p95 > 0 and largest > market_p95:
+        if score_size and market_p95 > 0 and largest > market_p95:
             score += 10; reasons.append(f"Above market p95 (${market_p95:,.0f})")
 
-        # 8. Low lifetime trades
+        # 7. Low lifetime trades
         if lt < 5: score += 10; reasons.append(f"{lt} lifetime trades total")
 
-        # 9. Volume spike on market
-        avg_d = vol1w / 7 if vol1w > 0 else 0
-        if avg_d > 0 and vol24 > avg_d * 3:
-            score += 10; reasons.append(f"Market vol spike {vol24/avg_d:.1f}x")
+        # 8. Volume spike on market
+        if score_size:
+            avg_d = vol1w / 7 if vol1w > 0 else 0
+            if avg_d > 0 and vol24 > avg_d * 3:
+                score += 10; reasons.append(f"Market vol spike {vol24/avg_d:.1f}x")
 
         scored[wallet] = {
             "wallet": wallet,
