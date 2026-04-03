@@ -391,15 +391,22 @@ def get_market_odds():
             if isinstance(prices, str):
                 try: prices = json.loads(prices)
                 except: prices = []
-            yp = float(prices[0]) if prices else 0
-            for tid in tokens:
-                markets[tid] = {
-                    "question": m.get("question", ""),
-                    "slug":     m.get("slug", ""),
-                    "yes_price": yp,
-                    "vol24":    m.get("volume24hr", 0) or 0,
-                    "vol1w":    m.get("volume1wk",  0) or 0,
-                }
+
+            # tokens[0] = YES token, tokens[1] = NO token (binary market convention).
+            # Store each token with its own side so the scorer gets the correct
+            # implied price regardless of which token Dune returns as asset_id.
+            yes_price = float(prices[0]) if len(prices) > 0 else 0.5
+            base = {
+                "question": m.get("question", ""),
+                "slug":     m.get("slug", ""),
+                "yes_price": yes_price,
+                "vol24":    m.get("volume24hr", 0) or 0,
+                "vol1w":    m.get("volume1wk",  0) or 0,
+            }
+            if len(tokens) > 0:
+                markets[str(tokens[0])] = {**base, "token_side": "YES"}
+            if len(tokens) > 1:
+                markets[str(tokens[1])] = {**base, "token_side": "NO"}
 
         if len(data) < limit:
             break  # last page
@@ -439,15 +446,26 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
         buy_usd         = float(row.get("buy_usd") or 0)
         sell_usd        = float(row.get("sell_usd") or 0)
 
-        # Aggregate across assets for wallets seen multiple times
+        # Aggregate across assets for wallets seen multiple times.
+        # We accumulate volume/trade counts and keep the worst-case (highest)
+        # z-score and trades_per_hour across all assets.
+        # net_ratio: recompute from running buy/sell totals so it stays accurate.
         if wallet in scored:
             s = scored[wallet]
-            s["total_usd"]  += total_usd
-            s["num_trades"] += num_trades
+            s["total_usd"]   += total_usd
+            s["num_trades"]  += num_trades
+            s["buy_usd"]     += buy_usd
+            s["sell_usd"]    += sell_usd
+            s["net_ratio"]    = (
+                abs(s["buy_usd"] - s["sell_usd"]) / s["total_usd"]
+                if s["total_usd"] > 0 else 0
+            )
             if largest > s["largest_trade"]:
                 s["largest_trade"] = largest
-            if max_zscore and (s["max_zscore"] is None or max_zscore > s["max_zscore"]):
+            if max_zscore and (s["max_zscore"] is None or float(max_zscore) > float(s["max_zscore"] or 0)):
                 s["max_zscore"] = max_zscore
+            if trades_per_hour > s["trades_per_hour"]:
+                s["trades_per_hour"] = trades_per_hour
             continue
 
         m   = meta_idx.get(wallet, {})
@@ -507,15 +525,21 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
                 reasons.append(f"New wallet elevated: {trades_per_hour:.1f} trades/hr")
 
         # ── 4. Contrarian: betting on a low-probability outcome ───────────────
-        # A net long (buying YES) is contrarian if yes_price is low.
-        # A net short (buying NO) is contrarian if yes_price is HIGH —
-        # the implied NO price (1 - yes_price) must be low.
-        # e.g. wallet buys NO on a 99.9% YES market → implied price = 0.1% → NOT contrarian.
-        is_net_short = sell_usd > buy_usd
-        implied_price = (1 - yp) if is_net_short else yp
+        # Use token_side from mkt_ctx (set in get_market_odds) to determine
+        # whether the traded token is YES or NO, then derive implied price.
+        # Falls back to net buy/sell direction if token_side is unavailable.
+        token_side = mkt.get("token_side", "")
+        if token_side == "NO":
+            implied_price = 1 - yp   # wallet traded the NO token
+        elif token_side == "YES":
+            implied_price = yp
+        else:
+            # Fallback: infer from net position
+            implied_price = (1 - yp) if sell_usd > buy_usd else yp
         if 0 < implied_price < 0.20:
             score += 15
-            reasons.append(f"Contrarian ({'NO' if is_net_short else 'YES'} @ {implied_price*100:.0f}% odds)")
+            side_label = token_side if token_side else ("NO" if sell_usd > buy_usd else "YES")
+            reasons.append(f"Contrarian ({side_label} @ {implied_price*100:.0f}% odds)")
 
         # ── 5. Coordination: N new wallets on same outcome within 24h ─────────
         if wallet in coord_wallets:
@@ -573,6 +597,8 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
             "score":         min(score, 100),
             "reasons":       reasons,
             "total_usd":     total_usd,
+            "buy_usd":       buy_usd,
+            "sell_usd":      sell_usd,
             "largest_trade": largest,
             "num_trades":    num_trades,
             "age_hours":     age,
@@ -580,6 +606,7 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
             "max_zscore":    max_zscore,
             "trades_per_hour": trades_per_hour,
             "net_ratio":     net_ratio,
+            "slug":          mkt.get("slug", ""),
             "question":      mkt.get("question", "Unknown"),
         }
 
@@ -622,7 +649,15 @@ def fetch_market_end_dates(asset_ids):
             if r.status_code != 200:
                 continue
             for m in (r.json() if isinstance(r.json(), list) else []):
-                end_iso = m.get("endDateIso") or m.get("endDate") or ""
+                # Prefer endDateIso (ISO string). endDate may be a Unix int
+                # in some Gamma responses — convert it if so.
+                end_iso = m.get("endDateIso") or ""
+                if not end_iso:
+                    raw = m.get("endDate")
+                    if isinstance(raw, (int, float)) and raw > 0:
+                        end_iso = datetime.fromtimestamp(raw, tz=timezone.utc).isoformat()
+                    elif isinstance(raw, str):
+                        end_iso = raw
                 tokens = m.get("clobTokenIds", "")
                 if isinstance(tokens, str):
                     try: tokens = json.loads(tokens)
@@ -684,6 +719,10 @@ def detect_insiders():
         return []
 
     print(f"  {len(trades)} trade rows from Dune")
+
+    # Diagnostic: how many trade rows have a matching market context entry
+    hit = sum(1 for r in trades if str(r.get("asset_id", "")) in mkt_ctx)
+    print(f"  market_ctx hit rate: {hit}/{len(trades)} trade rows matched ({hit*100//max(len(trades),1)}%)")
 
     # Filter out near-expiry markets before scoring — these are wash trading
     # patterns for money laundering, not insider signals.
@@ -846,6 +885,8 @@ def analyse(market, prev):
 # ─── Context Summary ─────────────────────────────────────────────────────────
 
 def build_context(results):
+    if not results:
+        return "No Iran/Kharg/Hormuz markets found or all resolved."
     lines = []
     inv    = next((r for r in results if "forces enter"  in r["q"].lower()), None)
     cf     = next((r for r in results if "ceasefire"     in r["q"].lower() and "oil" not in r["q"].lower()), None)
@@ -965,9 +1006,11 @@ def build_email(results, insiders):
                 if w.get("question") != "Unknown" else ""
             )
             net_str = f"<span style='font-size:11px;color:#555'> · net {w['net_ratio']:.0%}</span>" if w.get("net_ratio") else ""
+            # Link to Polymarket profile explorer
+            explorer_url = f"https://polymarket.com/profile/{w['wallet']}"
             irows += f"""<tr style='border-bottom:1px solid #eee'>
 <td style='padding:8px'><span style='font-size:20px;font-weight:bold;color:{col}'>{w["score"]}</span> {bar}</td>
-<td style='padding:8px'><a href='https://polygonscan.com/address/{w["wallet"]}' style='font-family:monospace;font-size:12px;color:#3498db;text-decoration:none'>{w["wallet_short"]}</a>{net_str}{mkt_line}</td>
+<td style='padding:8px'><a href='{explorer_url}' style='font-family:monospace;font-size:12px;color:#3498db;text-decoration:none'>{w["wallet_short"]}</a>{net_str}{mkt_line}</td>
 <td style='padding:8px;text-align:right;font-weight:bold'>{fmt(w["total_usd"])}</td>
 <td style='padding:8px;text-align:center'>{w["num_trades"]}</td>
 <td style='padding:8px'>{reasons}</td></tr>"""
