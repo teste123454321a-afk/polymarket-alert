@@ -25,7 +25,7 @@ import requests
 
 SMTP_EMAIL        = os.getenv("SMTP_EMAIL", "")
 SMTP_PASSWORD     = os.getenv("SMTP_PASSWORD", "")
-ALERT_RECIPIENT   =x os.getenv("ALERT_RECIPIENT", "") or SMTP_EMAIL
+ALERT_RECIPIENT   = os.getenv("ALERT_RECIPIENT", "") or SMTP_EMAIL
 DUNE_API_KEY      = os.getenv("DUNE_API_KEY", "")
 
 SNAPSHOT_FILE = Path("polymarket_snapshot.json")
