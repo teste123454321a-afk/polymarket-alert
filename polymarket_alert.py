@@ -404,22 +404,72 @@ def get_market_odds():
     return markets
 
 
-def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
+NOISE_KEYWORDS = [
+    # Crypto price targets — purely algorithmic, no insider edge
+    "bitcoin above", "bitcoin below", "bitcoin hit", "bitcoin reach",
+    "btc above", "btc below", "btc hit", "btc reach",
+    "ethereum above", "ethereum below", "eth above", "eth below",
+    "price above", "price below", "price hit", "price reach",
+    # Pure entertainment with no informational edge
+    "oscar", "grammy", "emmy", "golden globe",
+    "celebrity", "kardashian", "taylor swift album",
+]
+ 
+def is_insider_relevant_market(question: str) -> bool:
+    """Returns False only for markets where insider edge is structurally impossible."""
+    if not question:
+        return True  # unknown markets: include by default
+    q = question.lower()
+    return not any(k in q for k in NOISE_KEYWORDS)
+ 
+ 
+def hours_to_resolution(market_end_date: str | None) -> float | None:
+    """Returns hours until resolution, or None if unknown."""
+    if not market_end_date:
+        return None
+    try:
+        end = datetime.fromisoformat(market_end_date.replace("Z", "+00:00"))
+        delta = (end - datetime.now(timezone.utc)).total_seconds() / 3600
+        return max(delta, 0)
+    except:
+        return None
+ 
+ 
+# ─── Core Scorer ─────────────────────────────────────────────────────────────
+ 
+def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx, market_end_dates=None):
+    """
+    Score wallets for insider trading likelihood.
+ 
+    Parameters
+    ----------
+    trades          : rows from Q_LARGE_TRADES (Dune)
+    meta            : rows from Q_WALLET_META (Dune)
+    coordinated     : rows from Q_COORDINATION (Dune)
+    funded_clusters : rows from Q_FUNDING_SOURCES (Dune)
+    mkt_ctx         : dict[asset_id -> {question, slug, yes_price, vol24, vol1w}]
+    market_end_dates: dict[asset_id -> ISO end date string] — optional but improves timing signal
+    """
+    market_end_dates = market_end_dates or {}
     meta_idx = {r["wallet"]: r for r in (meta or [])}
-
-    coord_wallets = set()
-    for row in (coordinated or []):
-        for w in (row.get("wallets", []) if isinstance(row.get("wallets"), list) else []):
-            coord_wallets.add(w)
-
+ 
+    # Build funded wallet index
     wallet_to_funder = {}
     for row in (funded_clusters or []):
         funder = row.get("funder", "")
         if row.get("wallet_count", 0) >= 2:
             for w in (row.get("funded_wallets", []) if isinstance(row.get("funded_wallets"), list) else []):
                 wallet_to_funder[w] = funder
-
+ 
+    # Build coordination index (asset → list of wallets)
+    coord_by_asset = {}
+    for row in (coordinated or []):
+        asset = row.get("asset_id", "")
+        wallets = row.get("wallets", []) if isinstance(row.get("wallets"), list) else []
+        coord_by_asset[asset] = wallets
+ 
     scored = {}
+ 
     for row in (trades or []):
         wallet          = row.get("trader", "")
         asset           = row.get("asset_id", "")
@@ -428,185 +478,195 @@ def score_wallets(trades, meta, coordinated, funded_clusters, mkt_ctx):
         num_trades      = int(row.get("num_trades", 0))
         max_zscore      = row.get("max_zscore")
         market_p95      = float(row.get("market_p95_usd") or 0)
-        trades_per_hour = float(row.get("trades_per_hour") or 0)
         net_ratio       = float(row.get("net_ratio") or 0)
         buy_usd         = float(row.get("buy_usd") or 0)
         sell_usd        = float(row.get("sell_usd") or 0)
-
-        # Aggregate across assets for wallets seen multiple times.
-        # We accumulate volume/trade counts and keep the worst-case (highest)
-        # z-score and trades_per_hour across all assets.
-        # net_ratio: recompute from running buy/sell totals so it stays accurate.
+        trades_per_hour = float(row.get("trades_per_hour") or 0)
+ 
+        # Aggregate across assets for multi-market wallets
         if wallet in scored:
-          s = scored[wallet]
-          s["total_usd"]  += total_usd
-          s["num_trades"] += num_trades
-          s["buy_usd"]    += buy_usd
-          s["sell_usd"]   += sell_usd
-          s["net_position_usd"] = s["buy_usd"] - s["sell_usd"]
-          total_traded = s["buy_usd"] + s["sell_usd"]
-          s["net_ratio"] = abs(s["net_position_usd"]) / total_traded if total_traded > 0 else 0
-          if largest > s["largest_trade"]:
-              s["largest_trade"] = largest
-          if max_zscore and (s["max_zscore"] is None or max_zscore > s["max_zscore"]):
-              s["max_zscore"] = max_zscore
-          continue
-
+            s = scored[wallet]
+            s["total_usd"]  += total_usd
+            s["num_trades"] += num_trades
+            if largest > s["largest_trade"]:
+                s["largest_trade"] = largest
+            if max_zscore and (s["max_zscore"] is None or float(max_zscore) > s["max_zscore"]):
+                s["max_zscore"] = float(max_zscore)
+            continue
+ 
         m   = meta_idx.get(wallet, {})
-        age = m.get("wallet_age_hours", 9999)
-        lt  = m.get("lifetime_trades", 9999)
-        mkt = mkt_ctx.get(asset, {})
-        yp  = mkt.get("yes_price", 0.5)
-        vol24 = mkt.get("vol24", 0)
-        vol1w = mkt.get("vol1w", 0)
-
+        age = m.get("wallet_age_hours", 9999)         # hours since first ever trade
+        lt  = m.get("lifetime_trades", 0)              # total trades across all time
+ 
+        mkt         = mkt_ctx.get(asset, {})
+        question    = mkt.get("question", "")
+        yp          = mkt.get("yes_price", 0.5)
+        vol24       = mkt.get("vol24", 0)
+        vol1w       = mkt.get("vol1w", 0)
+ 
         score, reasons = 0, []
-
-        # ── 1. Wallet age ─────────────────────────────────────────────────────
+ 
+        # ── Gate: skip non-insider-relevant markets entirely ──────────────────
+        # Crypto price / sports markets have no insider edge.
+        # Scoring them just adds noise.
+        if question and not is_insider_relevant_market(question):
+            continue
+ 
+        # ── 1. Bot filter — new wallets are bots by default ──────────────────
+        # Unlike v1, new wallets START with a penalty.
+        # They can still score high if other signals override (e.g. funded cluster).
         if age <= 72:
-            score += 25
-            reasons.append(f"New wallet ({age:.0f}h old)")
-        if age <= 24:
-            score += 15
-            reasons.append("Created <24h ago")
-
-        # ── 2. Z-score: scaled by lifetime trades ─────────────────────────────
-        # High z-score from a fresh wallet = strong signal.
-        # Same z-score from a 1000-trade wallet = almost certainly just volume.
+            score -= 20
+            reasons.append(f"New wallet ({age:.0f}h) — likely bot")
+        if lt < 10:
+            score -= 15
+            reasons.append(f"Only {lt} lifetime trades — likely bot")
+        # Heavy velocity = bot, not urgency (unless also funded/coordinated)
+        if trades_per_hour >= 5:
+            score -= 15
+            reasons.append(f"High velocity ({trades_per_hour:.0f} trades/hr) — bot pattern")
+ 
+        # ── 2. Established wallet acting out of character ─────────────────────
+        # This is the PRIMARY insider signal. Someone who has traded for months
+        # suddenly making a large directional bet on a geopolitical market.
+        if lt >= 50 and age >= 720:   # 50+ lifetime trades, wallet ≥ 30 days old
+            score += 20
+            reasons.append(f"Established wallet ({lt} trades, {age/24:.0f}d old)")
+        if lt >= 200 and age >= 2160:  # 200+ trades, wallet ≥ 90 days old
+            score += 10               # additional boost for long history
+            reasons.append("Long-standing wallet (90d+)")
+ 
+        # ── 3. Position size on low-liquidity market ──────────────────────────
+        # Insiders target markets where $10K moves the needle.
+        # On a $10M market, $10K is noise. On a $100K market, it's a signal.
         if max_zscore is not None:
             z = float(max_zscore)
+            # For established wallets, z-score is a strong signal
             if z >= 3.0:
-                if lt < 20:    boost = 40
-                elif lt < 100: boost = 25
-                elif lt < 500: boost = 10
-                else:          boost = 3
+                if lt >= 200: boost = 30   # established wallet, very unusual trade
+                elif lt >= 50: boost = 20
+                else: boost = 5            # new wallet: z-score less meaningful
                 score += boost
-                reasons.append(f"Trade size {z:.1f}σ above mean (lt={lt})")
-            elif z >= 2.5:
-                if lt < 100:   boost = 15
-                elif lt < 500: boost = 5
-                else:          boost = 1
-                score += boost
-                reasons.append(f"Trade size {z:.1f}σ above mean (lt={lt})")
-            elif z >= 2.0 and lt < 100:
-                score += 8
-                reasons.append(f"Trade size {z:.1f}σ above mean")
-        else:
-            reasons.append("Trade in low-volume market (no baseline)")
-
-        # ── 3. Velocity: only meaningful on new wallets ───────────────────────
-        # Bots always have high velocity. Velocity only signals urgency
-        # if the wallet is also young (< 1 week).
-        if age <= 168 and num_trades >= 3:
-            if trades_per_hour >= 10:
-                score += 20
-                reasons.append(f"New wallet burst: {trades_per_hour:.0f} trades/hr")
-            elif trades_per_hour >= 5:
+                reasons.append(f"Trade size {z:.1f}σ above their own baseline (lt={lt})")
+            elif z >= 2.0 and lt >= 50:
                 score += 12
-                reasons.append(f"New wallet velocity: {trades_per_hour:.1f} trades/hr")
-            elif trades_per_hour >= 3:
-                score += 6
-                reasons.append(f"New wallet elevated: {trades_per_hour:.1f} trades/hr")
-
-        # ── 4. Contrarian: betting on a low-probability outcome ───────────────
-        # Use token_side from mkt_ctx (set in get_market_odds) to determine
-        # whether the traded token is YES or NO, then derive implied price.
-        # Falls back to net buy/sell direction if token_side is unavailable.
-        token_side = mkt.get("token_side", "")
-        if token_side == "NO":
-            implied_price = 1 - yp   # wallet traded the NO token
-        elif token_side == "YES":
-            implied_price = yp
-        else:
-            # Fallback: infer from net position
-            implied_price = (1 - yp) if sell_usd > buy_usd else yp
-        if 0 < implied_price < 0.20:
-            score += 15
-            side_label = token_side if token_side else ("NO" if sell_usd > buy_usd else "YES")
-            reasons.append(f"Contrarian ({side_label} @ {implied_price*100:.0f}% odds)")
-
-        # ── 5. Coordination: N new wallets on same outcome within 24h ─────────
-        if wallet in coord_wallets:
+                reasons.append(f"Trade size {z:.1f}σ above baseline")
+ 
+        # ── 4. Timing relative to resolution ─────────────────────────────────
+        # The closer to resolution, the more valuable insider info is.
+        # A trade 6h before resolution on a 20% market is very different from
+        # a trade 3 weeks before.
+        end_date = market_end_dates.get(asset)
+        hours_left = hours_to_resolution(end_date)
+        if hours_left is not None:
+            if hours_left <= 24:
+                score += 35
+                reasons.append(f"Trade within 24h of resolution ({hours_left:.0f}h left)")
+            elif hours_left <= 72:
+                score += 20
+                reasons.append(f"Trade within 72h of resolution ({hours_left:.0f}h left)")
+            elif hours_left <= 168:
+                score += 10
+                reasons.append(f"Trade within 1 week of resolution")
+ 
+        # ── 5. Directional conviction ─────────────────────────────────────────
+        # Insiders take a single directional position and hold it.
+        # Market makers stay near-neutral. Bots churn both sides.
+        if net_ratio >= 0.85:
             score += 20
-            reasons.append("Coordinated cluster (new wallets)")
-
-        # ── 6. Funding cluster: shared USDC source ────────────────────────────
+            direction = "long" if buy_usd >= sell_usd else "short"
+            reasons.append(f"High conviction {direction} position ({net_ratio:.0%} net)")
+        elif net_ratio >= 0.70:
+            score += 10
+            direction = "long" if buy_usd >= sell_usd else "short"
+            reasons.append(f"Directional {direction} position ({net_ratio:.0%} net)")
+        elif net_ratio < 0.20:
+            score -= 15
+            reasons.append("Near-neutral book — market maker pattern")
+ 
+        # ── 6. Contrarian bet on low-probability outcome ──────────────────────
+        # An insider betting heavily on a <15% outcome is the classic tell.
+        # e.g. buying YES on "Ceasefire in 24h" at 8% odds the day before a deal.
+        if 0 < yp < 0.15 and net_ratio >= 0.70:
+            score += 25
+            reasons.append(f"Contrarian conviction: {yp*100:.0f}% odds, {net_ratio:.0%} directional")
+        elif 0 < yp < 0.25 and net_ratio >= 0.70:
+            score += 12
+            reasons.append(f"Contrarian position at {yp*100:.0f}% odds")
+ 
+        # ── 7. Absolute position size ─────────────────────────────────────────
+        # Large absolute bets signal real money at stake.
+        if total_usd >= 50000:
+            score += 20
+            reasons.append(f"Large position: ${total_usd:,.0f}")
+        elif total_usd >= 20000:
+            score += 12
+            reasons.append(f"Significant position: ${total_usd:,.0f}")
+        elif total_usd >= 10000:
+            score += 6
+            reasons.append(f"Meaningful position: ${total_usd:,.0f}")
+ 
+        # ── 8. Funded cluster (shared USDC source) ────────────────────────────
+        # Multiple wallets funded from the same address suggests coordination.
+        # This is a strong signal regardless of wallet age.
         if wallet in wallet_to_funder:
             f = wallet_to_funder[wallet]
-            score += 25
-            reasons.append(f"Shared funder {f[:6]}…{f[-4:]}")
-
-        # ── 7. Above market p95 ───────────────────────────────────────────────
-        if market_p95 > 0 and largest > market_p95:
-            score += 10
-            reasons.append(f"Above market p95 (${market_p95:,.0f})")
-
-        # ── 8. Low lifetime trades ────────────────────────────────────────────
-        if lt < 5:
-            score += 10
-            reasons.append(f"{lt} lifetime trades total")
-
+            score += 30
+            reasons.append(f"Shared funder with other suspicious wallets ({f[:6]}…{f[-4:]})")
+ 
         # ── 9. Volume spike on market ─────────────────────────────────────────
+        # Unusual market volume can indicate informed activity or leaks.
         avg_d = vol1w / 7 if vol1w > 0 else 0
         if avg_d > 0 and vol24 > avg_d * 3:
             score += 10
-            reasons.append(f"Market vol spike {vol24/avg_d:.1f}x")
-
-        # ── 10. Net position direction ────────────────────────────────────────
-        # Insiders take a directional position and hold it.
-        # Market makers maintain near-neutral books.
-        if net_ratio >= 0.7:
-            score += 15
-            direction = "long" if buy_usd >= sell_usd else "short"
-            reasons.append(f"Directional position ({net_ratio:.0%} net {direction})")
-        elif net_ratio < 0.2 and total_usd > 0:
-            score -= 20
-            reasons.append("Near-neutral book (market maker pattern)")
-
-        # ── 11. Bot suppression: lifetime trade dampening ─────────────────────
-        # Applied after all additive signals so it doesn't zero out
-        # wallets that also hit strong signals (coordination, funded cluster).
-        # We dampen rather than zero out — a high-frequency wallet that also
-        # has a shared funder is still worth seeing, just ranked lower.
-        if lt > 500:
-            score = int(score * 0.4)
-            reasons.append(f"Dampened: {lt} lifetime trades (bot/MM likely)")
-        elif lt > 200:
-            score = int(score * 0.65)
-            reasons.append(f"Dampened: {lt} lifetime trades")
-
+            reasons.append(f"Market volume spike {vol24/avg_d:.1f}x 7-day average")
+ 
+        # ── 10. Coordinated established wallets ───────────────────────────────
+        # v1 flagged new wallet clusters (bots). 
+        # Real coordination worth flagging: established wallets moving together.
+        if asset in coord_by_asset:
+            coord_wallets_list = coord_by_asset[asset]
+            if wallet in coord_wallets_list:
+                # Only score this if the wallet is established
+                if lt >= 50:
+                    score += 20
+                    reasons.append("Coordinated with other established wallets on same market")
+                # New wallet coordination → still likely a bot farm, small signal
+                else:
+                    score += 5
+                    reasons.append("Coordinated cluster (but new wallets — possibly bot farm)")
+ 
+        # ── Final: skip if no positive signals fired ──────────────────────────
+        if score <= 0:
+            continue
+ 
         scored[wallet] = {
-            "wallet":        wallet,
-            "wallet_short":  f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 10 else wallet,
-            "score":         min(score, 100),
-            "reasons":       reasons,
-            "total_usd":     total_usd,
-            "buy_usd":       buy_usd,
-            "sell_usd":      sell_usd,
-            "largest_trade": largest,
-            "num_trades":    num_trades,
-            "age_hours":     age,
+            "wallet":          wallet,
+            "wallet_short":    f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 10 else wallet,
+            "score":           min(score, 100),
+            "reasons":         reasons,
+            "total_usd":       total_usd,
+            "largest_trade":   largest,
+            "num_trades":      num_trades,
+            "age_hours":       age,
             "lifetime_trades": lt,
-            "max_zscore":    max_zscore,
+            "max_zscore":      max_zscore,
             "trades_per_hour": trades_per_hour,
-            "net_ratio":     net_ratio,
-            "slug":          mkt.get("slug", ""),
-            "question":      mkt.get("question", "Unknown"),
-            "net_position_usd": buy_usd - sell_usd,
-            "buy_usd":          buy_usd,
-            "sell_usd":         sell_usd,
+            "net_ratio":       net_ratio,
+            "question":        question or "Unknown",
+            "hours_to_resolution": hours_left,
         }
-
-    # Adaptive threshold: 65th percentile with hard floor of 30.
-    # Raises the bar on busy/noisy days, never drops below 30.
+ 
+    # Threshold: top 35th percentile, hard floor 40
+    # Higher floor than v1 (was 30) — fewer but higher-quality alerts
     non_zero = [v["score"] for v in scored.values() if v["score"] > 0]
     if non_zero:
         scores_sorted = sorted(non_zero)
         idx = int(len(scores_sorted) * 0.65)
-        threshold = max(scores_sorted[min(idx, len(scores_sorted) - 1)], 30)
+        threshold = max(scores_sorted[min(idx, len(scores_sorted) - 1)], 40)
     else:
-        threshold = 30
-
+        threshold = 40
+ 
     results = [v for v in scored.values() if v["score"] >= threshold]
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:20]
@@ -1037,9 +1097,13 @@ def build_email(results, insiders):
 <b>Signals guide:</b><br>
 <b style='color:#e74c3c'>Red</b> = odds/volume anomaly · <b style='color:#8e44ad'>Purple</b> = orderbook whale<br>
 🐋 Orderbook = resting orders (intent) · 🕵️ Insider = executed trades scored on patterns<br>
-Score: new wallet (+25) · &lt;24h (+15) · z-score scaled by lifetime trades (+3→+40) · velocity on new wallets only (+6→+20) · contrarian &lt;20% odds (+15) · coordinated cluster (+20) · shared funder (+25) · above p95 (+10) · &lt;5 lifetime trades (+10) · vol spike (+10) · directional net position (+15)<br>
-Penalties: near-neutral book/MM pattern (−20) · &gt;200 lifetime trades (×0.65) · &gt;500 lifetime trades (×0.40)<br>
-Threshold: 65th percentile of day's scores, floor 30. All USD thresholds adapt to daily distribution.<br>
+<b>Insider score v2:</b><br>
+<b>Penalties (bot suppression):</b> new wallet &lt;72h (−20) · &lt;10 lifetime trades (−15) · high velocity (−15) · near-neutral book (−15)<br>
+<b>Established wallet signals:</b> 50+ trades &amp; 30d old (+20) · 90d+ (+10 extra)<br>
+<b>Timing:</b> &lt;24h to resolution (+35) · &lt;72h (+20) · &lt;1 week (+10)<br>
+<b>Position:</b> &gt;$50K (+20) · high conviction directional (+20) · contrarian &lt;15% odds (+25)<br>
+<b>Structure:</b> shared funder (+30) · coordinated established wallets (+20) · vol spike (+10)<br>
+Threshold: top 35th percentile, floor 40. Only geopolitical/political/legal markets scored.<br>
 <b>Sell "Yes" = betting AGAINST</b> · <b>Buy "Yes" = betting FOR</b></div>
 <p style='color:#bdc3c7;font-size:11px'>Sources: Polymarket Gamma/CLOB + Dune Analytics · Not financial advice</p>
 </body></html>"""
